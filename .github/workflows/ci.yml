@@ -43,6 +43,9 @@ jobs:
       - name: Check Jimeng gateway video resolutions
         working-directory: work/research-jimeng2api
         run: python -m pytest tests/test_video_resolutions.py
+      - name: Check Jimeng QR login readiness
+        working-directory: work/research-jimeng2api
+        run: python -m pytest tests/test_login_assistant.py
 
   docker:
     name: Docker build and health check

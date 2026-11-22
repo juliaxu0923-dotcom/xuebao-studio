@@ -34,6 +34,13 @@ Existing users and passwords are kept if the data volume is reused. Setting
 `ADMIN_PASSWORD` only configures the administrator on first initialization.
 API keys and account sessions are configured in the Studio admin page after login.
 
+QR login waits for the login control and a loaded QR image, instead of requiring
+the entire Jimeng home page to finish loading. If the server cannot reach Jimeng
+or its Douyin/Feishu login page, configure `JIMENG2API_HTTP_PROXY` in `.env` and
+recreate the container. The QR browser and generation API share this proxy.
+Use a proxy reachable from inside the container; `127.0.0.1` refers to the
+container itself. A blank QR area is never treated as a ready login code.
+
 ## IP Access
 
 `deploy/nginx.conf` is an HTTP virtual host template. Set `server_name` to the

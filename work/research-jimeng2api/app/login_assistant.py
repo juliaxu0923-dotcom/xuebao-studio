@@ -21,8 +21,10 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from urllib.parse import unquote, urlsplit
 
 from . import db, repo
+from .config import settings
 
 HOME = "https://jimeng.jianying.com/ai-tool/home"
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -42,6 +44,30 @@ _SESSIONS: dict[str, "LoginSession"] = {}
 
 class LoginUnavailable(RuntimeError):
     """Playwright 未安装/浏览器不可用 —— 面板据此显示安装指引。"""
+
+
+class LoginCancelled(Exception):
+    pass
+
+
+def _check_cancelled(s):
+    if s.stop.is_set():
+        raise LoginCancelled()
+
+
+def _proxy_options(url):
+    parsed = urlsplit(url)
+    if parsed.scheme not in ("http", "https", "socks5") or not parsed.hostname:
+        raise LoginUnavailable("登录代理地址无效，请检查服务器代理配置")
+    host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+    server = f"{parsed.scheme}://{host}"
+    if parsed.port:
+        server += f":{parsed.port}"
+    result = {"server": server}
+    if parsed.username is not None:
+        result["username"] = unquote(parsed.username)
+        result["password"] = unquote(parsed.password or "")
+    return result
 
 
 @dataclass
@@ -75,10 +101,13 @@ def _launch(p):
     errors: list[str] = []
     for channel in ("chrome", None):
         try:
-            return p.chromium.launch(
-                channel=channel, headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage"],
-            )
+            options = {
+                "channel": channel, "headless": True,
+                "args": ["--no-sandbox", "--disable-dev-shm-usage"],
+            }
+            if settings.http_proxy:
+                options["proxy"] = _proxy_options(settings.http_proxy)
+            return p.chromium.launch(**options)
         except Exception as e:  # noqa: BLE001 - 逐个候选尝试
             errors.append(f"{channel}: {type(e).__name__}")
     raise LoginUnavailable(
@@ -88,7 +117,7 @@ def _launch(p):
 
 
 def _qr_png(popup) -> bytes:
-    """截二维码：在**所有 frame** 里找最大的正方形 img/canvas，退化为整页截图。
+    """只截已加载的二维码候选，不把空白弹窗当成二维码。
 
     抖音的码是 `<img>`，飞书的码是 `<canvas>`（2026-11-19 实测，184×184）——
     只找 img 会把飞书那张整页截图塞进面板，二维码小到扫不出来。
@@ -100,24 +129,70 @@ def _qr_png(popup) -> bytes:
         try:
             elems = frame.locator("img, canvas")
             for i in range(min(elems.count(), 20)):
-                box = elems.nth(i).bounding_box()
+                element = elems.nth(i)
+                box = element.bounding_box(timeout=2000)
                 if not box:
                     continue
                 w, h = box["width"], box["height"]
                 if 140 <= w <= 480 and abs(w - h) <= 24 and w * h > best_area:
-                    best, best_area = elems.nth(i), w * h
+                    loaded = element.evaluate("""e => e.tagName === 'IMG'
+                        ? e.complete && e.naturalWidth > 0 && e.naturalHeight > 0
+                        : e.width > 0 && e.height > 0""")
+                    if loaded:
+                        best, best_area = element, w * h
         except Exception:  # noqa: BLE001
             continue
     if best is not None:
         try:
-            return best.screenshot(type="png")
+            return best.screenshot(type="png", timeout=3000)
         except Exception:  # noqa: BLE001
             pass
-    return popup.screenshot(type="png", full_page=False)
+    return b""
+
+
+def _open_login_page(page, s):
+    from playwright.sync_api import TimeoutError as BrowserTimeout, Error as BrowserError
+
+    button = page.get_by_role("button", name="登录", exact=True).first
+    for attempt in range(2):
+        _check_cancelled(s)
+        s.message = "正在连接即梦登录页…" if not attempt else "即梦页面加载较慢，正在重试…"
+        try:
+            page.goto(HOME, wait_until="commit", timeout=45000)
+        except BrowserError:
+            # A navigation timeout can leave a usable document. Check the control
+            # before retrying the navigation and discarding its progress.
+            if not button.is_visible():
+                if not attempt:
+                    continue
+                raise LoginUnavailable("服务器无法连接即梦登录页，请检查服务器到即梦的网络或配置出站代理") from None
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
+            _check_cancelled(s)
+            try:
+                button.wait_for(state="visible", timeout=3000)
+                return
+            except BrowserTimeout:
+                pass
+        if attempt:
+            raise LoginUnavailable("即梦登录按钮未加载完成，请检查服务器网络后重试")
+
+
+def _wait_for_qr(popup, s, timeout=90):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        _check_cancelled(s)
+        if popup.is_closed():
+            raise LoginUnavailable("登录窗口已关闭，请重新发起扫码")
+        qr = _qr_png(popup)
+        if qr:
+            return qr
+        popup.wait_for_timeout(500)
+    raise LoginUnavailable("登录页面已打开，但二维码未加载。请检查服务器到抖音或飞书登录服务的网络后重试")
 
 
 def _sid_of(ctx) -> tuple[str, int | None]:
-    jar = {c["name"]: c["value"] for c in ctx.cookies()}
+    jar = {c["name"]: c["value"] for c in ctx.cookies([HOME])}
     sid = jar.get("sessionid") or ""
     expires = None
     guard = jar.get("sid_guard") or ""
@@ -174,9 +249,10 @@ def _run(s: LoginSession) -> None:
                     locale="zh-CN", viewport={"width": 1280, "height": 900},
                     user_agent=UA)
                 page = ctx.new_page()
+                page.route("**/*", lambda route: route.abort() if route.request.resource_type == "media"
+                           else route.continue_())
                 s.message = "正在打开即梦登录页…"
-                page.goto(HOME, wait_until="domcontentloaded", timeout=60000)
-                page.wait_for_timeout(2500)
+                _open_login_page(page, s)
 
                 # 已经登录（复用了浏览器 profile 之类）：直接收
                 sid, expires = _sid_of(ctx)
@@ -187,25 +263,30 @@ def _run(s: LoginSession) -> None:
                 label, app_name = PROVIDERS.get(s.provider,
                                                 PROVIDERS["douyin"])
                 # 打开登录弹窗 → 勾协议 → 选中的第三方登录（弹出 OAuth 二维码页）
-                page.get_by_role("button", name="登录", exact=True).first.click()
+                provider_button = page.get_by_role("button", name=label, exact=True)
+                for _ in range(20):
+                    _check_cancelled(s)
+                    if provider_button.is_visible():
+                        break
+                    # Promotional overlays can cover the login button. Trigger its
+                    # own handler without interacting with the promotion.
+                    page.get_by_role("button", name="登录", exact=True).first.evaluate("b => b.click()")
+                    page.wait_for_timeout(500)
+                provider_button.wait_for(state="visible", timeout=15000)
                 s.message = "已打开登录弹窗，正在拉起第三方登录…"
-                page.wait_for_timeout(1200)
-                page.evaluate(
-                    "() => {const c=document.querySelector('input[type=checkbox]');"
+                provider_button.evaluate(
+                    "b => {const dialog=b.closest('[role=dialog]') || b.closest('.lv-modal-content') || document;"
+                    " const c=dialog.querySelector('input[type=checkbox]');"
                     " if(c && !c.checked) c.click();}")
-                with ctx.expect_page(timeout=20000) as newp:
-                    page.evaluate(
-                        "(label) => {const b=[...document.querySelectorAll('button')]"
-                        ".find(x=>x.getAttribute('aria-label')===label);"
-                        " if(b) b.click();}", label)
+                _check_cancelled(s)
+                with ctx.expect_page(timeout=30000) as newp:
+                    provider_button.evaluate("b => b.click()")
                 popup = newp.value
-                popup.wait_for_load_state("domcontentloaded")
-                popup.wait_for_timeout(2500)
-
+                s.message = f"正在加载{app_name}登录二维码…"
+                s.qr = _wait_for_qr(popup, s)
+                s.qr_version += 1
                 s.state = "waiting"
                 s.message = f"用{app_name} App 扫码，并在手机上确认"
-                s.qr = _qr_png(popup)
-                s.qr_version += 1
                 last_shot = time.time()
                 deadline = time.time() + TIMEOUT
                 closed_at: float | None = None
@@ -244,6 +325,9 @@ def _run(s: LoginSession) -> None:
                 s.message = "二维码已过期，请重新发起扫码"
             finally:
                 browser.close()
+    except LoginCancelled:
+        s.state = "cancelled"
+        s.message = "已取消扫码"
     except LoginUnavailable as e:
         s.state = "error"
         s.error = str(e)
