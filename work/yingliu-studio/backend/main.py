@@ -2,11 +2,11 @@
 import asyncio
 import hashlib
 import hmac
-import io
 import json
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import time
 import uuid
@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Depends, Request, Response, UploadFile, File, Body
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
@@ -29,6 +30,8 @@ SESSION_SECONDS = 7 * 24 * 3600
 COOKIE_NAME = 'yingliu_session'
 RUNNING = set()
 Image.MAX_IMAGE_PIXELS = 30_000_000
+MAX_UPLOAD_BYTES = 30 * 1024 * 1024
+UPLOAD_CHUNK_BYTES = 256 * 1024
 
 
 def one(sql, params=()):
@@ -168,6 +171,7 @@ def fail_job(job_id, error):
 
 @asynccontextmanager
 async def lifespan(_app):
+    _app.state.image_upload_lock = asyncio.Lock()
     setup_db()
     from .jimeng import install_models
     install_models()
@@ -397,52 +401,82 @@ def delete_project(project_id: int, user=Depends(whoami)):
     return {'ok': True}
 
 
+def prepare_upload_image(source):
+    formats = ('JPEG', 'PNG', 'WEBP')
+    try:
+        with Image.open(source, formats=formats) as probe:
+            probe.verify()
+        source.seek(0)
+        with Image.open(source, formats=formats) as image:
+            rgb = image if image.mode == 'RGB' else image.convert('RGB')
+            rgb.thumbnail((2560, 2560))
+            rgb.load()
+            return rgb
+    except (UnidentifiedImageError, ValueError, SyntaxError, OSError, Image.DecompressionBombError) as exc:
+        raise HTTPException(400, '请上传有效的 JPEG/PNG/WebP 图片') from exc
+
+
+def validate_upload_media(source, suffix):
+    header = source.read(13)
+    source.seek(0)
+    if suffix == '.wav':
+        valid = header.startswith(b'RIFF') and header[8:12] == b'WAVE'
+    elif suffix == '.mp3':
+        valid = header.startswith(b'ID3') or (len(header) > 2 and header[0] == 255 and header[1] & 224 == 224)
+    elif suffix == '.mp4':
+        valid = len(header) == 13 and header[4:8] == b'ftyp'
+    else:
+        valid = header.startswith(b'\x1aE\xdf\xa3')
+    if not valid:
+        kind = '音频' if suffix in ('.mp3', '.wav') else '视频'
+        raise HTTPException(400, f'{kind}文件格式无效')
+
+
+def save_upload(source, user_id, suffix, media_type):
+    source.seek(0, os.SEEK_END)
+    if source.tell() > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, '素材不能超过 30MB')
+    source.seek(0)
+
+    filename = uuid.uuid4().hex + suffix
+    destination = MEDIA / filename
+    temporary = destination.with_suffix('.part')
+    try:
+        if suffix == '.jpg':
+            with prepare_upload_image(source) as image:
+                image.save(temporary, format='JPEG', quality=88)
+        else:
+            validate_upload_media(source, suffix)
+            with temporary.open('wb') as output:
+                shutil.copyfileobj(source, output, length=UPLOAD_CHUNK_BYTES)
+        temporary.replace(destination)
+        try:
+            with db() as c:
+                aid = c.execute('INSERT INTO assets(user_id,filename,mime,created_at) VALUES(?,?,?,?)',
+                                (user_id, filename, media_type, now())).lastrowid
+        except Exception:
+            destination.unlink(missing_ok=True)
+            raise
+    finally:
+        temporary.unlink(missing_ok=True)
+    result = {'id': aid, 'url': f'/api/media/{filename}'}
+    if suffix != '.jpg':
+        result['mime'] = media_type
+    return result
+
+
 @app.post('/api/uploads')
 async def upload_image(file: UploadFile = File(...), user=Depends(whoami)):
-    raw = await file.read(30 * 1024 * 1024 + 1)
-    if len(raw) > 30 * 1024 * 1024:
+    if file.size is not None and file.size > MAX_UPLOAD_BYTES:
         raise HTTPException(413, '素材不能超过 30MB')
     media_type = (file.content_type or '').lower()
     suffix = Path(file.filename or '').suffix.lower()
     if suffix in ('.mp3', '.wav'):
-        valid = (suffix == '.wav' and raw[:4] == b'RIFF' and raw[8:12] == b'WAVE') or (suffix == '.mp3' and (raw[:3] == b'ID3' or (len(raw)>2 and raw[0]==255 and raw[1]&224==224)))
-        if not valid:
-            raise HTTPException(400, '音频文件格式无效')
         media_type = 'audio/mpeg' if suffix == '.mp3' else 'audio/wav'
-        filename = uuid.uuid4().hex + suffix
-        (MEDIA / filename).write_bytes(raw)
-        with db() as c:
-            aid = c.execute('INSERT INTO assets(user_id,filename,mime,created_at) VALUES(?,?,?,?)',
-                (user['id'],filename,media_type,now())).lastrowid
-        return {'id':aid,'url':f'/api/media/{filename}','mime':media_type}
-    if media_type in ('video/mp4', 'video/webm') and suffix in ('.mp4', '.webm'):
-        valid_video = (suffix == '.mp4' and len(raw) > 12 and raw[4:8] == b'ftyp') or (suffix == '.webm' and raw.startswith(b'\x1aE\xdf\xa3'))
-        if not valid_video:
-            raise HTTPException(400, '视频文件格式无效')
-        filename = uuid.uuid4().hex + suffix
-        (MEDIA / filename).write_bytes(raw)
-        with db() as c:
-            c.execute('INSERT INTO assets(user_id,filename,mime,created_at) VALUES(?,?,?,?)',
-                      (user['id'], filename, media_type, now()))
-            aid = c.execute('SELECT last_insert_rowid() AS id').fetchone()['id']
-        return {'id': aid, 'url': f'/api/media/{filename}', 'mime': media_type}
-    try:
-        img = Image.open(io.BytesIO(raw))
-        img.verify()
-        img = Image.open(io.BytesIO(raw))
-        if img.format not in ('JPEG', 'PNG', 'WEBP'):
-            raise ValueError('格式不支持')
-        img = img.convert('RGB')
-        img.thumbnail((2560, 2560))
-    except (UnidentifiedImageError, ValueError, SyntaxError, OSError, Image.DecompressionBombError):
-        raise HTTPException(400, '请上传有效的 JPEG/PNG/WebP 图片')
-    filename = uuid.uuid4().hex + '.jpg'
-    img.save(MEDIA / filename, format='JPEG', quality=88)
-    with db() as c:
-        c.execute('INSERT INTO assets(user_id,filename,mime,created_at) VALUES(?,?,?,?)',
-                  (user['id'], filename, 'image/jpeg', now()))
-        aid = c.execute('SELECT last_insert_rowid() AS id').fetchone()['id']
-    return {'id': aid, 'url': f'/api/media/{filename}'}
+    elif not (media_type in ('video/mp4', 'video/webm') and suffix in ('.mp4', '.webm')):
+        async with app.state.image_upload_lock:
+            return await run_in_threadpool(save_upload, file.file, user['id'], '.jpg', 'image/jpeg')
+    return await run_in_threadpool(save_upload, file.file, user['id'], suffix, media_type)
 
 
 @app.get('/api/media/{filename}')
