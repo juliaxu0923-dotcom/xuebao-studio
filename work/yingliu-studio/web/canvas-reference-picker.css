@@ -1,0 +1,15 @@
+.studio-reference-picker{width:560px;max-width:calc(100vw - 32px);max-height:80vh;overflow:auto;padding:20px;border:1px solid #454545;border-radius:8px;background:#242424;color:#f3f3f3;font:14px system-ui;box-sizing:border-box}
+.studio-reference-picker{margin:auto}
+.studio-reference-picker::backdrop{background:#0009}
+.studio-reference-picker header{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.studio-reference-picker button{cursor:pointer;background:#333;color:inherit;border:1px solid #555;border-radius:6px;padding:9px 14px;font:inherit}
+.studio-reference-picker header button{font-size:22px;padding:0;width:32px;height:32px}
+.studio-reference-picker .reference-actions{margin:18px 0}
+.studio-reference-picker h3{font-size:14px;font-weight:500}
+.studio-reference-picker .reference-items{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:10px}
+.studio-reference-picker .reference-items button{min-width:0;padding:8px;display:flex;flex-direction:column;gap:8px;text-align:left}
+.studio-reference-picker .reference-items img,.studio-reference-picker .reference-items video{width:100%;height:100px;object-fit:contain;background:#181818}
+.studio-reference-picker .reference-items audio{display:none}
+.studio-reference-picker span{overflow-wrap:anywhere}
+.studio-reference-picker button:hover{border-color:#74aaff}
+.studio-reference-picker [role=status]{color:#bbb}

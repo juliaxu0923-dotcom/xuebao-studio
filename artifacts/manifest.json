@@ -1,0 +1,15 @@
+{
+  "runtime": {
+    "filename": "infinite-canvas-0.8.9-web.zip",
+    "version": "0.8.9",
+    "sha256": "b8058e39015e9db77abb2001d90747792d6b7d7607901279c56b6301c7e46203",
+    "source": "User-provided Infinite.Canvas_0.8.9_x64-setup.zip",
+    "project_url": "https://github.com/tigerowo/infinite-canvas",
+    "notes": "Exact extracted web runtime including its standalone Node dependencies."
+  },
+  "gateway": {
+    "source": "https://github.com/rsfree/jimeng2api",
+    "base_commit": "b0cd6afdd109ae4d4e0ee6a6747aeba26dc479a9",
+    "local_changes_included": true
+  }
+}

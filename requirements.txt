@@ -1,0 +1,4 @@
+-r work/yingliu-studio/requirements.txt
+-r work/research-jimeng2api/requirements.txt
+-r work/research-jimeng2api/requirements-login.txt
+

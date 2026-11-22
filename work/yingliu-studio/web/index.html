@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#f7f7fa">
+  <title>雪宝 Studio · AI 创作工作台</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/editor.css?v=20261120-duration-menu">
+</head>
+<body>
+<div class="app-shell" id="appShell">
+  <aside class="sidebar" id="sidebar">
+    <div class="brand"><div class="brand-symbol">✦</div><div><strong>雪宝 <span>STUDIO</span></strong><small>AI Creative Workspace</small></div><button class="icon-btn mobile-only" id="closeSidebar" title="关闭菜单">×</button></div>
+    <div class="side-scroll">
+      <div class="menu-title">创作空间</div>
+      <button class="nav-item active" data-view="canvas"><span class="nav-icon">▦</span> 节点画布 <span class="nav-arrow">›</span></button>
+      <button class="nav-item" data-view="image"><span class="nav-icon">▧</span> 图片生成</button>
+      <button class="nav-item" data-view="video"><span class="nav-icon">▷</span> 视频生成</button>
+      <button class="nav-item" data-view="history"><span class="nav-icon">◷</span> 我的作品</button>
+      <div class="side-section"><div class="menu-title">我的项目</div><button class="text-action" id="newProjectBtn">＋ 新建画布</button></div>
+      <div id="projectList" class="project-list"></div>
+      <div class="side-section"><div class="menu-title">常用工具</div></div>
+      <button class="nav-item" id="uploadShortcut"><span class="nav-icon">⇧</span> 上传参考图</button>
+      <button class="nav-item admin-only" data-view="admin" style="display:none"><span class="nav-icon">⚙</span> 管理后台 <span class="nav-arrow">›</span></button>
+    </div>
+    <div class="side-footer"><div class="credit-card"><div class="micro">积分余额</div><strong id="sidePoints">—</strong><span class="credit-chip">● 账户积分</span></div><div class="account"><div class="avatar" id="avatar">Y</div><div class="account-name"><strong id="accountName">未登录</strong><small id="accountRole">创作用户</small></div><button class="text-icon" id="logoutBtn" title="退出登录">↪</button></div></div>
+  </aside>
+  <main class="main">
+    <header class="topbar"><button id="mobileMenu" class="icon-btn mobile-only" aria-label="菜单">☰</button><div class="breadcrumbs"><small>工作台 / 创作</small><b id="pageTitle">节点画布</b></div><div class="top-actions"><div class="top-search">⌕ <span>输入提示词，开始创作</span><kbd>Ctrl K</kbd></div><span class="top-points">🟡 <b id="topPoints">—</b> 积分</span></div></header>
+    <section id="canvasView" class="view active">
+      <div class="canvas-stage" id="stage"><div class="canvas-pattern"></div>
+        <div class="canvas-toolbar"><button class="pill-select" id="renameProjectBtn"><span id="projectTitle">默认画布</span>⌄</button><span class="save-status" id="saveStatus">● 已保存</span></div>
+        <div class="canvas-topright"><button class="floating-icon" id="centerCanvasBtn" title="居中画布">⌖</button><button class="floating-icon" id="fitCanvasBtn" title="适合画布">⤢</button></div>
+        <div class="canvas-transform" id="canvasTransform"><svg id="connections" class="connections" xmlns="http://www.w3.org/2000/svg"></svg><div id="nodeLayer"></div></div>
+        <div class="canvas-tools"><button data-add="text" title="添加文字节点"><b>＋</b><small>文字</small></button><button data-add="image" title="添加图片节点"><b>▧</b><small>图片</small></button><button data-add="video" title="添加视频节点"><b>▷</b><small>视频</small></button><button id="nodeUploadBtn" title="上传图片"><b>⇧</b><small>上传</small></button></div>
+        <div class="canvas-zoom"><button id="zoomOutBtn">−</button><span id="zoomLabel">100%</span><button id="zoomInBtn">＋</button></div>
+        <div class="canvas-hint" id="canvasHint">拖动节点调整位置 · 点击右侧圆点，再点击另一节点左侧圆点连接</div>
+      </div>
+    </section>
+    <section id="imageView" class="view page-view generation-view"><div class="page-head"><div><h2>图片生成</h2><p>独立的图片生成工作区，可上传参考图、选择模型和画幅。</p></div></div><div class="generation-layout"><div class="generation-form"><label>提示词<textarea id="imagePrompt" rows="5" placeholder="描述你想生成的画面"></textarea></label><div class="generation-controls"><label>模型<select id="imageModel"></select></label><label>画幅<select id="imageRatio"><option>1:1</option><option>9:16</option><option>16:9</option><option>4:3</option></select></label><label>分辨率<select id="imageResolution"><option>1K</option><option>2K</option><option>4K</option></select></label><label>数量<select id="imageCount"><option>1</option><option>2</option><option>3</option><option>4</option></select></label></div><div class="generation-controls"><label>风格<input id="imageStyle" placeholder="可选，例如：电影感"></label><label>镜头<input id="imageCamera" placeholder="可选，例如：人像特写"></label><label>焦段<input id="imageLens" placeholder="可选，例如：50mm"></label><label class="check-option"><input id="imageEnhance" type="checkbox"> AI 润色提示词</label></div><div class="generation-actions"><button id="imageReference" class="secondary-btn">上传参考图</button><span id="imageRefName"></span><span id="imageCost"></span><button id="imageGenerate" class="primary-btn">生成图片</button></div><div id="imageResults" class="generation-results"></div></div></div></section>
+    <section id="videoView" class="view page-view generation-view"><div class="page-head"><div><h2>视频生成</h2><p>独立的视频生成工作区，可设置时长、画幅和参考素材。</p></div></div><div class="generation-layout"><div class="generation-form"><label>视频描述<textarea id="videoPrompt" rows="5" placeholder="描述视频画面、动作、镜头和运镜"></textarea></label><div class="generation-controls"><label>模型<select id="videoModel"></select></label><label>画幅<select id="videoRatio"><option>16:9</option><option>9:16</option><option>1:1</option><option>4:3</option></select></label><label>分辨率<select id="videoResolution"><option>480p</option><option selected>720p</option><option>1080p</option></select></label><label>时长（秒）<input id="videoDuration" type="number" min="4" max="15" step="1" value="5" required inputmode="numeric"></label></div><div class="generation-actions"><button id="videoReference" class="secondary-btn">上传参考图</button><span id="videoRefName"></span><span id="videoCost"></span><button id="videoGenerate" class="primary-btn">生成视频</button></div><div id="videoResults" class="generation-results"></div></div></div></section>
+    <section id="historyView" class="view page-view"><div class="page-head"><div><h2>我的作品</h2><p>查看图片、视频的生成状态与历史记录。</p></div><button class="secondary-btn" id="refreshHistory">⟳ 刷新</button></div><div id="historyGrid" class="history-grid"></div></section>
+    <section id="adminView" class="view page-view"><div class="page-head"><div><h2>平台管理后台</h2><p>模型接口、用户积分与任务统计。密钥只保存在服务器。</p></div></div>
+      <div class="stats-grid" id="statsGrid"></div>
+      <div class="admin-tabs"><button class="admin-tab active" data-admin-tab="models">模型 / API</button><button class="admin-tab" data-admin-tab="users">用户积分</button><button class="admin-tab" data-admin-tab="jobs">生成任务</button><button class="admin-tab" data-admin-tab="invitations">邀请码</button><button class="admin-tab" data-admin-tab="messages">消息 <span id="adminMessageBadge" class="status-pill failed" hidden>0</span></button><button class="admin-tab" data-admin-tab="jimeng">即梦账号池</button></div>
+      <div id="modelActions" style="margin-bottom:16px;text-align:right"><button class="primary-btn" id="addModelBtn">＋ 创建模型接口</button></div>
+      <div class="table-wrap" id="adminTable"></div>
+    </section>
+  </main>
+</div>
+<div class="overlay" id="loginOverlay"><div class="login-card"><div class="login-logo">✦</div><h1>欢迎来到雪宝 Studio</h1><p>登录你的创作工作台，连接不同的 AI 图片与视频模型。</p><div class="login-tabs"><button class="active" data-login-tab="login">登录</button><button data-login-tab="register">注册</button></div><form id="loginForm"><label>用户名<input id="loginName" autocomplete="username" minlength="3" required placeholder="输入用户名"></label><label>密码<input id="loginPassword" type="password" autocomplete="current-password" minlength="8" required placeholder="输入密码"></label><label id="invitationLabel" hidden>邀请码<input id="invitationCode" maxlength="80" autocomplete="off" placeholder="输入一次性邀请码"></label><button class="primary-btn wide" id="submitAuth" type="submit">登录工作台 →</button></form><div class="inline-error" id="authError"></div><p class="login-foot">没有接入真实模型时，可使用后台的演示模型体验流程。</p></div></div>
+<div class="overlay modal-backdrop" id="modelOverlay" hidden><div class="modal-card"><div class="modal-title"><div><h2 id="modelModalTitle">创建模型接口</h2><p>配置后将自动显示在用户端的模型下拉列表中。</p></div><button class="icon-btn" id="closeModelModal">×</button></div><form id="modelForm"><div class="form-grid">
+  <label>展示名称<input name="name" required placeholder="例如：我的视频模型"></label><label>模型代号<input name="model_code" required placeholder="例如：my-video-v1"></label>
+  <label>生成类型<select name="kind"><option value="image">图片</option><option value="video">视频</option></select></label><label>接口协议<select name="protocol" id="protocolField"><option value="sync_json">同步 JSON（常见图片接口）</option><option value="async_json">异步 JSON（常见视频接口）</option><option value="demo">演示模式</option></select></label>
+  <label class="full">提交 API 地址<input name="api_url" placeholder="https://api.example.com/v1/generate"></label>
+  <label class="full">查询任务 URL（异步接口）<input name="poll_url" placeholder="https://api.example.com/tasks/{{task_id}}"></label>
+  <label>认证类型<select name="auth_mode"><option value="bearer">Authorization: Bearer</option><option value="header">自定义 Key Header</option><option value="none">无需认证</option></select></label>
+  <label>自定义 Header<input name="auth_header" value="X-API-Key"></label>
+  <label class="full">API Key<input name="api_key" type="password" autocomplete="off" placeholder="保存后不回显；编辑时留空表示不修改"></label>
+  <label class="full">请求 JSON 模板<textarea name="request_template" rows="4" spellcheck="false">{"model":"{{model}}","prompt":"{{prompt}}","aspect_ratio":"{{ratio}}"}</textarea></label>
+  <label>输出 URL 路径<input name="result_path" value="data.0.url"></label><label>扣费积分<input name="cost" type="number" min="0" value="10"></label>
+  <label>任务 ID 路径<input name="task_id_path" value="id"></label><label>状态字段路径<input name="status_path" value="status"></label>
+  <label>完成状态（逗号分隔）<input name="completed_status" value="completed,succeeded,success"></label><label>失败状态（逗号分隔）<input name="failed_status" value="failed,error"></label>
+  <label class="full check-label"><input name="enabled" type="checkbox" checked> 在用户端启用此模型</label>
+  </div><div class="hint-box">支持占位符：<code>{{prompt}}</code>、<code>{{model}}</code>、<code>{{ratio}}</code>、<code>{{duration}}</code>、<code>{{resolution}}</code>、<code>{{reference_base64}}</code>。不同供应商的返回格式请按文档填写路径。</div>
+  <div class="modal-actions"><button type="button" class="secondary-btn" id="cancelModelModal">取消</button><button type="submit" class="primary-btn">保存模型</button></div><div class="inline-error" id="modelError"></div>
+</form></div></div>
+<input type="file" accept="image/jpeg,image/png,image/webp" id="fileInput" hidden>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+<script src="/static/jimeng.js?v=20261121-account-concurrency-v1" defer></script>
+<script src="/static/app.js?v=20261121-video-resolutions-v1" defer></script>
+</body>
+</html>

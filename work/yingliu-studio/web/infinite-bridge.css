@@ -1,0 +1,37 @@
+.studio-asset-picker-card {position:relative;min-width:0}
+.studio-asset-picker-card > button:first-child {width:100%;height:100%}
+.studio-asset-picker-card > button.studio-asset-remove {position:absolute;top:8px;right:8px;z-index:1;width:32px;height:32px;min-width:32px;padding:0;border-radius:6px}
+.studio-asset-picker-card > button.studio-asset-remove:focus-visible {outline:2px solid currentColor;outline-offset:2px}
+.studio-video-panel-anchor {position:fixed;z-index:75;width:min(622px,calc(100vw - 24px));letter-spacing:0}
+.studio-video-prompt-panel {max-height:calc(100dvh - 180px);overflow-y:auto;min-width:0}
+.studio-video-prompt-panel > .mt-2 {flex-wrap:wrap}
+.studio-video-prompt-panel > .mt-2 > .flex {flex-wrap:wrap;max-width:100%}
+.studio-video-prompt-panel > .mt-2 > button {margin-left:auto}
+.canvas-composer-model-picker[data-studio-model-kind="video"] {width:280px!important;min-width:0!important;max-width:100%;height:auto;min-height:40px;padding-top:6px;padding-bottom:6px}
+.canvas-composer-model-picker[data-studio-model-kind="video"] .canvas-model-picker-text {white-space:normal;overflow:visible;text-overflow:clip;overflow-wrap:anywhere;line-height:20px}
+.studio-model-option {display:flex;align-items:center;gap:8px;width:100%;min-width:0;letter-spacing:0}
+.studio-model-option-labels {display:flex;flex-direction:column;min-width:0;gap:2px}
+.studio-model-option-name,.studio-model-option-channel {white-space:normal;overflow-wrap:anywhere;line-height:20px}
+.studio-model-menu [role="option"] {height:auto;min-height:32px}
+.studio-video-history {margin-top:12px;padding-top:10px;border-top:1px solid var(--history-border);min-width:0}
+.studio-video-history-head {display:flex;align-items:center;justify-content:space-between;font-size:12px;margin-bottom:8px;gap:8px}
+.studio-video-history-head strong {font-weight:600}
+.studio-video-history-head span,.studio-video-history-empty,.studio-video-history-details {color:var(--history-muted);font-size:11px}
+.studio-video-history-list {display:flex;gap:8px;overflow-x:auto;padding-bottom:4px;overscroll-behavior:contain}
+.studio-video-history-item {flex:0 0 172px;min-width:0;overflow:hidden;border:1px solid var(--history-border);border-radius:6px;background:var(--history-fill)}
+.studio-video-history-item.is-selected {border-color:var(--history-active)}
+.studio-video-history-preview {display:flex;align-items:center;justify-content:center;width:100%;aspect-ratio:16/9;overflow:hidden;background:transparent;border:0;padding:0;color:inherit;font-size:12px;cursor:pointer}
+.studio-video-history-preview:disabled {cursor:default}
+.studio-video-history-preview video {width:100%;height:100%;object-fit:contain}
+.studio-video-history-prompt {margin:6px 8px 4px;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.studio-video-history-details {padding:0 8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.studio-video-history-actions {display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px}
+.studio-video-history-error {display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:12px;margin-bottom:8px}
+.studio-video-history-modal video {display:block;width:100%;max-height:55dvh;background:#161616}
+.studio-video-history-modal p {white-space:pre-wrap;overflow-wrap:anywhere;max-height:100px;overflow:auto;font-size:13px}
+@media (max-width:700px) {
+  .grid:has(> .studio-asset-picker-card) {grid-template-columns:repeat(2,minmax(0,1fr))}
+  .pointer-events-none.absolute:has(> .thin-scrollbar) {left:12px!important;right:12px!important;bottom:12px!important}
+  .absolute.bottom-5.left-5:has([aria-label="重置视图"]) {bottom:80px!important;left:12px!important}
+  button[title="双击修改画布名称"] {max-width:110px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+}
