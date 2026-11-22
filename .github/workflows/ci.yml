@@ -64,3 +64,34 @@ jobs:
       - name: Remove CI containers and test data
         if: always()
         run: docker compose down --volumes
+
+  publish:
+    name: Publish Docker image to GHCR
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [tests, docker]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build registry image
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          docker build \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --tag "$image:$GITHUB_SHA" \
+            --tag "$image:latest" .
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Push image tags
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          docker push "$image:$GITHUB_SHA"
+          docker push "$image:latest"
