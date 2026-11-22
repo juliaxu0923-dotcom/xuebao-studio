@@ -20,6 +20,18 @@ python -m venv .venv
 
 三个服务均监听本机：Studio 为 8000，画布渲染为 8001，即梦网关为 8300。启动前应确保这些端口可用。代码上传 GitHub 不会自动产生可供朋友访问的网站；完整应用需要 Python、Node.js 和持久存储，不能直接用 GitHub Pages 运行。
 
+## Linux 服务器部署
+
+仓库根目录新增完整项目的 `Dockerfile` 和 `compose.yaml`，同时启动网页、画布和即梦网关。需要 Docker Engine、Compose 插件和 nginx：
+
+```bash
+cp .env.example .env
+docker compose up -d --build
+docker compose ps
+```
+
+按 [服务器部署说明](deploy/README.md) 配置 nginx，即可通过服务器 IP 访问。`studio-data` 数据卷保存用户、作品、密钥和账号池，更新时保留该卷。网页默认绑定宿主机 `127.0.0.1:8000`，由 nginx 对外提供 80 端口访问。
+
 ## 当前功能
 
 - 注册需要一次性邀请码；后台可管理用户、密码与积分。
@@ -46,7 +58,7 @@ THIRD_PARTY.md               第三方来源与版本说明
 
 画布压缩包包含安装包中的 Next.js 编译产物和配套 Node 依赖，解压至 `work/infinite-inspect/resources/app/web`。适配层依赖这个版本的具体 JS 文件，替换成其他版本前需要更新适配代码。
 
-`work/yingliu-studio/Dockerfile` 和 `compose.yaml` 来自早期仅 Studio 的版本，不能直接启动完整的三服务项目；当前以本页 Windows 启动方式为准。
+`work/yingliu-studio/` 内的 Docker 文件来自早期仅 Studio 的版本。Linux 部署请使用仓库根目录的 Docker 文件。
 
 ## 检查
 
