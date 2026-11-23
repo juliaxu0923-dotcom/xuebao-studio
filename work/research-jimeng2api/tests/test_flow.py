@@ -1,7 +1,10 @@
 """任务生命周期：提交 → 轮询 → 终态。上游用桩替换，不产生任何真实请求。"""
 from __future__ import annotations
 
-from app import db, repo, service
+import json
+import sqlite3
+
+from app import api, db, repo, service
 from app.upstream.client import JimengClient
 
 
@@ -43,6 +46,51 @@ def test_submit_and_poll_success(monkeypatch):
     assert t["finished_at"] is not None
     acc = repo.get_account(aid)
     assert acc["success_count"] == 1
+
+
+def test_status_checks_do_not_read_reference_payloads(monkeypatch):
+    account_id = _account()
+    reference = "data:image/png;base64,dGVzdA=="
+    task_id = repo.create_task(
+        task_id="with-reference", api_key_id=None, mode="i2i",
+        model="high_aes_general_v55", prompt="reference", negative_prompt="",
+        size="2048x2048", width=2048, height=2048, resolution="2k", count=1,
+        seed=None, image_uris=[reference], mask_uri=reference,
+        extras={"requested_model": "seedream-5.5"},
+    )["id"]
+    repo.mark_task_running(task_id, account_id, forecast=1)
+    db.execute("UPDATE tasks SET next_poll_at = 0 WHERE id = ?", (task_id,))
+    images = [{"url": "https://cdn.example/result.png"}]
+    monkeypatch.setattr(
+        JimengClient, "fetch_many",
+        lambda self, ids: {task_id: {"ok": True, "images": images}},
+    )
+
+    def deny_reference_reads(action, table, column, *_):
+        if action == sqlite3.SQLITE_READ and table == "tasks" and column in {
+            "image_uris", "mask_uri", "submit_draft",
+        }:
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    connection = db.conn()
+    connection.set_authorizer(deny_reference_reads)
+    admin = {"id": None, "is_admin": True}
+    try:
+        assert api.poll(task_id, admin).status_code == 202
+        service.poll_once()
+        response = api.poll(task_id, admin)
+        assert response.status_code == 200
+        assert json.loads(response.body)["data"] == images
+        detail = api.task_detail(task_id, admin)
+        assert detail["requested_model"] == "seedream-5.5"
+        assert service.wait_task(task_id, 1)["images"] == images
+    finally:
+        connection.set_authorizer(None)
+
+    stored = repo.get_task(task_id)
+    assert stored["image_uris"] == [reference]
+    assert stored["mask_uri"] == reference
 
 
 def test_poll_failure_is_terminal(monkeypatch):

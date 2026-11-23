@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -10,6 +11,7 @@ import shutil
 import sqlite3
 import time
 import uuid
+from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -23,15 +25,24 @@ from pydantic import BaseModel, Field, field_validator
 from PIL import Image, UnidentifiedImageError
 
 from .db import db, setup_db, now, DATA, ROOT, hash_password, check_password, encrypt_secret
-from .adapters import MEDIA, invoke_provider, check_provider_url
+from .adapters import MEDIA, build_context, invoke_provider, check_provider_url
+from .resource_usage import ResourceMonitor
 
 WEB = ROOT / 'web'
 SESSION_SECONDS = 7 * 24 * 3600
 COOKIE_NAME = 'yingliu_session'
-RUNNING = set()
 Image.MAX_IMAGE_PIXELS = 30_000_000
 MAX_UPLOAD_BYTES = 30 * 1024 * 1024
+MAX_UPLOAD_IMAGE_PIXELS = 4096 * 4096
 UPLOAD_CHUNK_BYTES = 256 * 1024
+MAX_JOB_CONCURRENCY = 2
+RESOURCE_SAMPLE_SECONDS = 5
+CPU_PERCENT_TO_EXPAND = 50
+CPU_PERCENT_TO_REDUCE = 80
+MEMORY_BYTES_TO_EXPAND = 384 * 1024 * 1024
+MEMORY_BYTES_TO_REDUCE = 256 * 1024 * 1024
+SAMPLES_TO_EXPAND = 3
+logger = logging.getLogger(__name__)
 
 
 def one(sql, params=()):
@@ -85,11 +96,90 @@ def present_job(j):
 
 
 def launch_job(job_id):
-    if job_id in RUNNING:
+    state = app.state
+    if job_id in state.scheduled_jobs:
         return
-    RUNNING.add(job_id)
-    task = asyncio.create_task(execute_job(job_id))
-    task.add_done_callback(lambda _: RUNNING.discard(job_id))
+    state.scheduled_jobs.add(job_id)
+    state.job_queue.append(job_id)
+    state.jobs_changed.set()
+
+
+async def run_job_worker(state):
+    while True:
+        while not state.job_queue or state.running_jobs >= state.job_concurrency:
+            state.jobs_changed.clear()
+            await state.jobs_changed.wait()
+        job_id = state.job_queue.popleft()
+        state.running_jobs += 1
+        try:
+            await execute_job(job_id)
+        except Exception:
+            logger.exception('Could not execute Studio job %s', job_id)
+        finally:
+            state.running_jobs -= 1
+            state.scheduled_jobs.discard(job_id)
+            state.jobs_changed.set()
+
+
+async def adjust_job_concurrency(state):
+    monitor = ResourceMonitor()
+    healthy_samples = 0
+    while True:
+        usage = monitor.sample()
+        cpu = usage.cpu_percent
+        memory = usage.available_memory_bytes
+        limit = state.job_concurrency
+        if cpu is None or memory is None or cpu >= CPU_PERCENT_TO_REDUCE or memory < MEMORY_BYTES_TO_REDUCE:
+            limit = 1
+            healthy_samples = 0
+        elif cpu <= CPU_PERCENT_TO_EXPAND and memory >= MEMORY_BYTES_TO_EXPAND:
+            healthy_samples += 1
+            if healthy_samples >= SAMPLES_TO_EXPAND:
+                limit = MAX_JOB_CONCURRENCY
+        else:
+            healthy_samples = 0
+        if limit != state.job_concurrency:
+            state.job_concurrency = limit
+            state.jobs_changed.set()
+            logger.info('Studio job concurrency set to %s (CPU %s%%, available RAM %s bytes)', limit, cpu, memory)
+        await asyncio.sleep(RESOURCE_SAMPLE_SECONDS)
+
+
+def prepare_job_references(model, job):
+    reference_path = None
+    reference_url = None
+    opts = json.loads(job['options_json'])
+    user_id = job['user_id']
+    if opts.get('reference_asset_id'):
+        asset = assert_owner('assets', int(opts['reference_asset_id']), user_id)
+        reference_path = MEDIA / asset['filename']
+    elif opts.get('reference_job_id'):
+        source = assert_owner('jobs', opts['reference_job_id'], user_id)
+        if source['status'] != 'completed' or source['kind'] != 'image':
+            raise ValueError('参考图片任务尚未完成')
+        if source['result_url'].startswith('/api/media/'):
+            reference_path = MEDIA / source['result_url'].rsplit('/', 1)[-1]
+        else:
+            reference_url = source['result_url']
+
+    references = []
+    for ref in opts.get('reference_inputs') or []:
+        if ref.get('asset_id'):
+            asset = assert_owner('assets', ref['asset_id'], user_id)
+            value = build_context(model, job, MEDIA / asset['filename'])['reference_base64']
+            if not value:
+                raise ValueError('多人物参考目前支持图片素材')
+        else:
+            source = assert_owner('jobs', ref['job_id'], user_id)
+            if source['status'] != 'completed' or source['kind'] != 'image':
+                raise ValueError('参考图片任务尚未完成')
+            value = source['result_url']
+            if value.startswith('/api/media/'):
+                value = build_context(model, job, MEDIA / value.rsplit('/', 1)[-1])['reference_base64']
+        references.append(value)
+    if references:
+        job['reference_images'] = references
+    return reference_path, reference_url
 
 
 async def execute_job(job_id):
@@ -102,47 +192,15 @@ async def execute_job(job_id):
         return
     with db() as c:
         c.execute("UPDATE jobs SET status='running', updated_at=? WHERE id=?", (now(), job_id))
-    reference_path = None
-    reference_url = None
     try:
-        opts = json.loads(job['options_json'])
-        asset_id = opts.get('reference_asset_id')
-        if asset_id:
-            asset = assert_owner('assets', int(asset_id), job['user_id'])
-            reference_path = MEDIA / asset['filename']
-        elif opts.get('reference_job_id'):
-            source = assert_owner('jobs', opts['reference_job_id'], job['user_id'])
-            if source['status'] != 'completed' or source['kind'] != 'image':
-                raise ValueError('参考图片任务尚未完成')
-            if source['result_url'].startswith('/api/media/'):
-                reference_path = MEDIA / source['result_url'].rsplit('/', 1)[-1]
-            else:
-                reference_url = source['result_url']
+        reference_path = reference_url = None
+        if not job['provider_task_id']:
+            reference_path, reference_url = await run_in_threadpool(prepare_job_references, model, job)
 
         def set_provider_id(provider_id):
             with db() as c:
                 c.execute('UPDATE jobs SET provider_task_id=?, updated_at=? WHERE id=?',
                           (provider_id, now(), job_id))
-
-        if opts.get('reference_inputs'):
-            from .adapters import build_context
-            references = []
-            for ref in opts['reference_inputs']:
-                if ref.get('asset_id'):
-                    asset = assert_owner('assets', ref['asset_id'], job['user_id'])
-                    context = build_context(model, job, MEDIA / asset['filename'])
-                    value = context['reference_base64']
-                    if not value:
-                        raise ValueError('多人物参考目前支持图片素材')
-                else:
-                    source = assert_owner('jobs', ref['job_id'], job['user_id'])
-                    if source['status'] != 'completed' or source['kind'] != 'image':
-                        raise ValueError('参考图片任务尚未完成')
-                    value = source['result_url']
-                    if value.startswith('/api/media/'):
-                        value = build_context(model, job, MEDIA / value.rsplit('/',1)[-1])['reference_base64']
-                references.append(value)
-            job['reference_images'] = references
 
         url = await invoke_provider(model, job, reference_path, reference_url, set_provider_id)
         with db() as c:
@@ -171,16 +229,34 @@ def fail_job(job_id, error):
 
 @asynccontextmanager
 async def lifespan(_app):
-    _app.state.image_upload_lock = asyncio.Lock()
+    state = _app.state
+    state.image_upload_lock = asyncio.Lock()
+    state.job_queue = deque()
+    state.scheduled_jobs = set()
+    state.jobs_changed = asyncio.Event()
+    state.running_jobs = 0
+    state.job_concurrency = 1
     setup_db()
     from .jimeng import install_models
     install_models()
     from .infinite_canvas import setup_canvas_bridge
     setup_canvas_bridge()
-    for j in allrows("SELECT id FROM jobs WHERE status IN ('queued','running')"):
+    for j in allrows("""SELECT id FROM jobs WHERE status IN ('queued', 'running')
+                        ORDER BY status = 'queued', created_at, id"""):
         launch_job(j['id'])
-    yield
-    # Work-in-process task execution is a single-node starter, not a durable job queue.
+    workers = [
+        asyncio.create_task(run_job_worker(state))
+        for _ in range(MAX_JOB_CONCURRENCY)
+    ]
+    resource_monitor = asyncio.create_task(adjust_job_concurrency(state))
+    try:
+        yield
+    finally:
+        # Unfinished jobs stay in SQLite so the next startup can resume them.
+        resource_monitor.cancel()
+        for worker in workers:
+            worker.cancel()
+        await asyncio.gather(resource_monitor, *workers, return_exceptions=True)
 
 
 app = FastAPI(title='雪宝 Studio API', version='0.1.0', lifespan=lifespan)
@@ -403,16 +479,30 @@ def delete_project(project_id: int, user=Depends(whoami)):
 
 def prepare_upload_image(source):
     formats = ('JPEG', 'PNG', 'WEBP')
+    size_error = f'图片像素不能超过 {MAX_UPLOAD_IMAGE_PIXELS:,}'
     try:
         with Image.open(source, formats=formats) as probe:
+            if probe.width * probe.height > MAX_UPLOAD_IMAGE_PIXELS:
+                raise HTTPException(413, size_error)
             probe.verify()
         source.seek(0)
-        with Image.open(source, formats=formats) as image:
-            rgb = image if image.mode == 'RGB' else image.convert('RGB')
+        rgb = Image.open(source, formats=formats)
+        if rgb.mode != 'RGB':
+            original = rgb
+            try:
+                rgb = original.convert('RGB')
+            finally:
+                original.close()
+        try:
             rgb.thumbnail((2560, 2560))
             rgb.load()
             return rgb
-    except (UnidentifiedImageError, ValueError, SyntaxError, OSError, Image.DecompressionBombError) as exc:
+        except Exception:
+            rgb.close()
+            raise
+    except Image.DecompressionBombError as exc:
+        raise HTTPException(413, size_error) from exc
+    except (UnidentifiedImageError, ValueError, SyntaxError, OSError) as exc:
         raise HTTPException(400, '请上传有效的 JPEG/PNG/WebP 图片') from exc
 
 

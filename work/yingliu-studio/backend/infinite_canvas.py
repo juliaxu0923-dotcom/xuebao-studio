@@ -4,18 +4,38 @@ import json
 import re
 from urllib.parse import urlparse
 from pathlib import Path
+from tempfile import SpooledTemporaryFile
 
 import httpx
 from fastapi import Depends, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
+from starlette.concurrency import run_in_threadpool
 
 from .db import db, now, ROOT
 
 RUNTIME = ROOT.parent / 'infinite-inspect/resources/app/web'
 RENDERER = 'http://127.0.0.1:8001'
 ASSET_PICKER_CHUNKS = ('10h2fnm8xrvhb', '16bxll2rpzygx', '1i__p954nri0t', '3907tj1oyvi8n')
+MEDIA_PROXY_MAX_BYTES = 100 * 1024 * 1024
+MEDIA_PROXY_CHUNK_BYTES = 256 * 1024
+
+
+class _SpooledMediaResponse(StreamingResponse):
+    def __init__(self, spool, size, media_type):
+        self._spool = spool
+        super().__init__(
+            iter(lambda: spool.read(MEDIA_PROXY_CHUNK_BYTES), b''),
+            media_type=media_type,
+            headers={'Content-Length': str(size)},
+        )
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._spool.close()
 
 
 def setup_canvas_bridge():
@@ -171,19 +191,32 @@ def register(app, api):
         if not one('SELECT id FROM jobs WHERE user_id=? AND result_url=?', (user['id'], url)):
             raise HTTPException(404, '只能读取当前账号生成的媒体')
         api['check_provider_url'](url)
-        async with httpx.AsyncClient(timeout=60, follow_redirects=False) as client:
-            async with client.stream('GET', url) as result:
-                result.raise_for_status()
-                chunks, size = [], 0
-                async for chunk in result.aiter_bytes():
-                    size += len(chunk)
-                    if size > 100 * 1024 * 1024:
+        # Finish validation before sending headers so oversized downloads can still return 413.
+        spool = SpooledTemporaryFile(max_size=MEDIA_PROXY_CHUNK_BYTES, dir=api['MEDIA'])
+        try:
+            async with httpx.AsyncClient(
+                timeout=60, follow_redirects=False, headers={'Accept-Encoding': 'identity'},
+            ) as client:
+                async with client.stream('GET', url) as result:
+                    result.raise_for_status()
+                    length = result.headers.get('content-length', '')
+                    if (result.headers.get('content-encoding', 'identity').lower() == 'identity'
+                            and length.isdecimal() and int(length) > MEDIA_PROXY_MAX_BYTES):
                         raise HTTPException(413, '媒体文件过大')
-                    chunks.append(chunk)
-                content_type = result.headers.get('content-type', 'application/octet-stream').split(';')[0]
-                if not content_type.startswith(('image/', 'video/')):
-                    raise HTTPException(400, '上游未返回图片或视频')
-                return Response(b''.join(chunks), media_type=content_type)
+                    content_type = result.headers.get('content-type', 'application/octet-stream').split(';')[0]
+                    if not content_type.startswith(('image/', 'video/')):
+                        raise HTTPException(400, '上游未返回图片或视频')
+                    size = 0
+                    async for chunk in result.aiter_bytes(chunk_size=MEDIA_PROXY_CHUNK_BYTES):
+                        size += len(chunk)
+                        if size > MEDIA_PROXY_MAX_BYTES:
+                            raise HTTPException(413, '媒体文件过大')
+                        await run_in_threadpool(spool.write, chunk)
+            spool.seek(0)
+            return _SpooledMediaResponse(spool, size, content_type)
+        except BaseException:
+            spool.close()
+            raise
 
     async def upload(file, user):
         result = await api['upload_image'](file, user)

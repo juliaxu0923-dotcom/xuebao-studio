@@ -26,6 +26,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import api, db, panel_api, remote_browser, security
+from .browser_slot import BrowserBusy
 from .config import settings
 from .coordinator import coordinator
 from .public_errors import HTTP_CODES, error_body, public_error
@@ -91,9 +92,12 @@ def create_app() -> FastAPI:
             await ws.close(code=4401)
             return
         await ws.accept()
-        session = remote_browser.attach()
-        await ws.send_json({"type": "state", "state": session.state,
-                            "meta": session.meta})
+        try:
+            session = remote_browser.attach()
+        except BrowserBusy as exc:
+            await ws.send_json({"type": "error", "message": str(exc)})
+            await ws.close()
+            return
 
         async def reader() -> None:
             while True:
@@ -104,7 +108,9 @@ def create_app() -> FastAPI:
         task = asyncio.create_task(reader())
         closed_sent = False
         try:
-            while True:
+            await ws.send_json({"type": "state", "state": session.state,
+                                "meta": session.meta})
+            while not task.done():
                 frame = session.pop_frame()
                 if frame:
                     await ws.send_bytes(frame)
@@ -126,6 +132,8 @@ def create_app() -> FastAPI:
         finally:
             task.cancel()
             remote_browser.detach(session)
+            with contextlib.suppress(asyncio.CancelledError, WebSocketDisconnect):
+                await task
 
     # ----------------------------------------------------------- 静态资源
     if WEB.exists():
@@ -212,6 +220,11 @@ def create_app() -> FastAPI:
         return JSONResponse(status_code=exc.status_code,
                             content=error_body(code, str(exc.detail)),
                             headers=dict(exc.headers or {}))
+
+    @app.exception_handler(BrowserBusy)
+    async def browser_busy(_: Request, exc: BrowserBusy) -> JSONResponse:
+        return JSONResponse(status_code=409,
+                            content=error_body(HTTP_CODES[409], str(exc)))
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(_: Request,

@@ -349,20 +349,11 @@ def charge_key(key_id: int | None, credits: int | None) -> None:
 
 
 # --------------------------------------------------------------------- 任务
-TASK_COLUMNS = (
-    "id", "api_key_id", "account_id", "mode", "model", "prompt",
-    "negative_prompt", "size", "width", "height", "resolution", "count",
-    "seed", "image_uris", "status", "upstream_status", "progress", "images",
-    "error", "error_kind", "forecast_credits", "charged_credits", "attempts",
-    "submit_draft", "created_at", "started_at", "finished_at", "updated_at",
-    "next_poll_at",
-)
-
-
 def task_row(row) -> dict:
-    d = {k: row[k] for k in row.keys()}
+    d = dict(row)
     d["images"] = db.loads(d.get("images"), [])
-    d["image_uris"] = db.loads(d.get("image_uris"), [])
+    if "image_uris" in d:
+        d["image_uris"] = db.loads(d["image_uris"], [])
     d["extras"] = db.loads(d.get("extras"), {})
     d["degradations"] = db.loads(d.get("degradations"), [])
     d.pop("submit_draft", None)
@@ -391,6 +382,17 @@ def create_task(*, task_id: str, api_key_id: int | None, mode: str,
 
 def get_task(task_id: str) -> dict | None:
     row = db.one("SELECT * FROM tasks WHERE id = ?", (task_id,))
+    return task_row(row) if row else None
+
+
+def get_task_status(task_id: str) -> dict | None:
+    """Read response fields without loading the original reference images or mask."""
+    row = db.one(
+        "SELECT id, api_key_id, status, progress, model, mode, extras, count, size, "
+        "resolution, created_at, started_at, finished_at, error, error_kind, "
+        "forecast_credits, charged_credits, images FROM tasks WHERE id = ?",
+        (task_id,),
+    )
     return task_row(row) if row else None
 
 
@@ -502,9 +504,18 @@ def set_charged(task_id: str, credits: int | None) -> None:
 def due_tasks(now: int | None = None) -> list[dict]:
     ts = now or db.now()
     rows = db.query(
-        "SELECT * FROM tasks WHERE status = 'running' AND next_poll_at <= ? "
+        "SELECT id, api_key_id, account_id, started_at, upstream_status, progress, "
+        "forecast_credits FROM tasks WHERE status = 'running' AND next_poll_at <= ? "
         "ORDER BY started_at ASC LIMIT 100", (ts,))
-    return [task_row(r) for r in rows]
+    return [dict(row) for row in rows]
+
+
+def recent_submissions() -> list[dict]:
+    rows = db.query(
+        "SELECT id, updated_at FROM tasks WHERE status = 'submitting' "
+        "ORDER BY created_at DESC LIMIT 20"
+    )
+    return [dict(row) for row in rows]
 
 
 def list_tasks(*, status: str = "", q: str = "", limit: int = 50,

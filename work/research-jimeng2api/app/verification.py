@@ -201,15 +201,13 @@ def start(account_id, purpose='challenge'):
         if purpose == 'challenge' and not url:
             raise HTTPException(409, '未获得可用验证地址，请查看生成诊断。官网首页不是验证页面。')
         old = _sessions.get(account_id)
-        if not old and sum(s.state in ('starting', 'live') for s in _sessions.values()) >= 3:
-            raise HTTPException(409, '请先关闭其他账号验证窗口')
         if old:
             old.close()
         entry = remote_browser.RemoteSession(verification_account_id=account_id,
             target_url=url if purpose == 'challenge' else remote_browser.HOME)
         entry.attached = 1
-        _sessions[account_id] = entry
         entry.start()
+        _sessions[account_id] = entry
         return {'session_id': entry.id, 'event_id': record['id'],
                 'has_challenge_url': bool(url) and purpose == 'challenge',
                 'purpose': purpose, 'account_id': account_id}

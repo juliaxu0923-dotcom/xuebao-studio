@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from urllib.parse import unquote, urlsplit
 
 from . import db, repo
+from .browser_slot import start_browser_thread
 from .config import settings
 
 HOME = "https://jimeng.jianying.com/ai-tool/home"
@@ -235,6 +236,7 @@ def _finish_success(s: LoginSession, sid: str, expires: int | None) -> None:
 
 def _run(s: LoginSession) -> None:
     try:
+        _check_cancelled(s)
         try:
             from playwright.sync_api import sync_playwright
         except ImportError as e:  # pragma: no cover - 环境相关
@@ -245,6 +247,7 @@ def _run(s: LoginSession) -> None:
         with sync_playwright() as p:
             browser = _launch(p)
             try:
+                _check_cancelled(s)
                 ctx = browser.new_context(
                     locale="zh-CN", viewport={"width": 1280, "height": 900},
                     user_agent=UA)
@@ -345,7 +348,7 @@ def start(remark: str = "", provider: str = "douyin") -> LoginSession:
     """发起一个扫码会话；已有进行中的会话时直接复用它。"""
     with _LOCK:
         for s in _SESSIONS.values():
-            if s.state in ("starting", "waiting"):
+            if s.state in ("starting", "waiting") and not s.stop.is_set():
                 return s
         # 清理 10 分钟前的终态会话，避免内存堆积
         for k, v in list(_SESSIONS.items()):
@@ -354,8 +357,8 @@ def start(remark: str = "", provider: str = "douyin") -> LoginSession:
         provider = provider if provider in PROVIDERS else "douyin"
         s = LoginSession(id=uuid.uuid4().hex[:12], remark=remark,
                          provider=provider)
+        start_browser_thread(lambda: _run(s), name="jimeng-login")
         _SESSIONS[s.id] = s
-        threading.Thread(target=_run, args=(s,), name="jimeng-login", daemon=True).start()
         return s
 
 

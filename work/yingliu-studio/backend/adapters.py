@@ -8,6 +8,7 @@ import os
 import re
 import socket
 import shutil
+from contextlib import suppress
 from pathlib import Path
 from urllib.parse import urlparse
 from html import escape
@@ -139,23 +140,36 @@ async def make_demo_video(job_id, prompt, ratio):
     """Generate a short, explicitly watermarked animation for UI testing."""
     filename = make_demo_image(job_id, prompt, ratio, is_video=True)
     video_name = f'{job_id}.mp4'
+    destination = MEDIA / video_name
+    temporary = destination.with_suffix('.part.mp4')
     ffmpeg = shutil.which('ffmpeg')
     if not ffmpeg:
         from imageio_ffmpeg import get_ffmpeg_exe
         ffmpeg = get_ffmpeg_exe()
     cmd = [ffmpeg, '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
-           '-loop', '1', '-framerate', '12', '-i', str(MEDIA / filename),
+           '-loop', '1', '-framerate', '12', '-threads', '1', '-i', str(MEDIA / filename),
+           '-filter_threads', '1',
            '-t', '3', '-vf', 'format=yuv420p', '-c:v', 'libx264', '-preset', 'ultrafast',
-           '-movflags', '+faststart', str(MEDIA / video_name)]
+           '-threads', '1', '-movflags', '+faststart', str(temporary)]
     try:
         process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.DEVNULL,
                                                         stderr=asyncio.subprocess.PIPE)
-        _, err = await asyncio.wait_for(process.communicate(), timeout=25)
+        try:
+            _, err = await asyncio.wait_for(process.communicate(), timeout=25)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            if process.returncode is None:
+                with suppress(ProcessLookupError):
+                    process.kill()
+            await process.communicate()
+            raise
         if process.returncode:
             raise RuntimeError(err.decode(errors='replace')[-400:])
+        temporary.replace(destination)
         return video_name
     except (OSError, asyncio.TimeoutError) as exc:
         raise RuntimeError(f'演示视频需要 FFmpeg: {exc}') from exc
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 async def invoke_provider(model, job, reference_path, reference_url, set_provider_id):
@@ -171,7 +185,11 @@ async def invoke_provider(model, job, reference_path, reference_url, set_provide
 
     from .jimeng import generate, is_jimeng
     if is_jimeng(model):
-        return await generate(model, job, build_context(model, job, reference_path, reference_url), set_provider_id)
+        return await generate(
+            model, job,
+            await asyncio.to_thread(build_context, model, job, reference_path, reference_url),
+            set_provider_id,
+        )
 
     check_provider_url(model['api_url'])
     context = build_context(model, job, reference_path, reference_url)

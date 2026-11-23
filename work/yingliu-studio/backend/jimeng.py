@@ -174,11 +174,13 @@ async def generate(model, job, context, set_provider_id):
         if reference:
             payload['image'] = reference
         if job.get('reference_images'):
-            payload['image'] = job['reference_images']
+            payload['image'] = job.pop('reference_images')
             payload['reference_mode'] = 'multi_image'
         result = await request_gateway('POST', '/async/v1/images/generations', payload)
         task_id = result['task_id']
         set_provider_id(task_id)
+        del payload, reference
+    del context
     # Resume persisted tasks after a Studio restart; never resubmit a known task.
     for _ in range(21600):
         try:

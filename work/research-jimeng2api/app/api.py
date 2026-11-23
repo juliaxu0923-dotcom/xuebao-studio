@@ -447,7 +447,7 @@ def generate_async(req: GenerateRequest, key: dict = Depends(require_key)) -> An
 
 @router.get("/async/v1/images/generations/{task_id}")
 def poll(task_id: str, key: dict = Depends(require_key)) -> Any:
-    task = repo.get_task(task_id)
+    task = repo.get_task_status(task_id)
     if not task:
         raise HTTPException(404, detail="task 不存在")
     if not key.get("is_admin") and task.get("api_key_id") != key["id"]:
@@ -463,7 +463,7 @@ def poll(task_id: str, key: dict = Depends(require_key)) -> Any:
 
 @router.get("/v1/tasks/{task_id}")
 def task_detail(task_id: str, key: dict = Depends(require_key)) -> dict:
-    task = repo.get_task(task_id)
+    task = repo.get_task_status(task_id)
     if not task:
         raise HTTPException(404, detail="task 不存在")
     if not key.get("is_admin") and task.get("api_key_id") != key["id"]:

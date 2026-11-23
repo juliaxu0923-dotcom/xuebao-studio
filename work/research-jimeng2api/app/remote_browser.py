@@ -30,6 +30,8 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
+from .browser_slot import start_browser_thread
+
 TIMEOUT = 600          # 单会话最长 10 分钟
 DETACH_GRACE = 90      # 页面关闭后保留 90 秒，方便刷新/重连
 VIEWPORT = {"width": 1280, "height": 800}
@@ -83,9 +85,7 @@ class RemoteSession:
     def start(self) -> None:
         if self.thread:
             return
-        self.thread = threading.Thread(target=self._run, name="jimeng-remote",
-                                       daemon=True)
-        self.thread.start()
+        self.thread = start_browser_thread(self._run, name="jimeng-remote")
 
     def close(self) -> None:
         self.stop.set()
@@ -111,6 +111,9 @@ class RemoteSession:
 
     # ------------------------------------------------------------------ 主循环
     def _run(self) -> None:
+        if self.stop.is_set():
+            self.state = "closed"
+            return
         try:
             from playwright.sync_api import sync_playwright
         except ImportError:
@@ -124,6 +127,8 @@ class RemoteSession:
             with sync_playwright() as p:
                 browser = _launch(p)
                 try:
+                    if self.stop.is_set():
+                        return
                     ctx = browser.new_context(
                         viewport=dict(VIEWPORT), locale="zh-CN", user_agent=UA)
                     if self.verification_account_id is not None:
@@ -308,8 +313,9 @@ def attach() -> RemoteSession:
     global _SESSION
     with _LOCK:
         if _SESSION is None or _SESSION.state in ("closed", "error"):
-            _SESSION = RemoteSession()
-            _SESSION.start()
+            session = RemoteSession()
+            session.start()
+            _SESSION = session
         _SESSION.attached += 1
         _SESSION.last_detach = 0.0
         return _SESSION

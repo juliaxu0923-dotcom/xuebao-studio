@@ -716,11 +716,11 @@ def wait_task(task_id: str, timeout: float) -> dict:
     """同步接口用：**只查本地库**，不碰上游。"""
     deadline = time.monotonic() + max(1.0, timeout)
     while time.monotonic() < deadline:
-        task = repo.get_task(task_id)
+        task = repo.get_task_status(task_id)
         if task and task["status"] in ("succeeded", "failed"):
             return task
         time.sleep(0.4)
-    return repo.get_task(task_id) or {}
+    return repo.get_task_status(task_id) or {}
 
 
 # ---------------------------------------------------------------- 提交执行
@@ -1006,7 +1006,7 @@ def poll_once() -> None:
     if not tasks:
         return
     # 兜底：卡在 submitting 超过 2 分钟的任务（进程重启/提交线程崩溃）
-    for row in repo.list_tasks(status="submitting", limit=20)["items"]:
+    for row in repo.recent_submissions():
         if db.now() - (row["updated_at"] or 0) > 120:
             repo.mark_task_failed(
                 row["id"],

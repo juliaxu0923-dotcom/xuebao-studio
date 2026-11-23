@@ -1,4 +1,6 @@
 """Login must tolerate a slow page without publishing a blank QR screenshot."""
+import threading
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -6,6 +8,7 @@ import pytest
 from playwright.sync_api import Error as BrowserError, TimeoutError as BrowserTimeout
 
 from app import login_assistant as login
+from app import remote_browser, verification
 
 
 def test_navigation_timeout_keeps_an_already_usable_login_page():
@@ -101,3 +104,55 @@ def test_session_cookie_is_scoped_to_jimeng():
                                     {'name': 'sid_guard', 'value': 'x|1700000000|86400|x'}]
     assert login._sid_of(context) == ('jimeng-session', 1700086400)
     context.cookies.assert_called_once_with([login.HOME])
+
+
+def test_browser_slot_is_shared_until_chromium_closes(client, auth, monkeypatch):
+    closing = threading.Event()
+    finish_close = threading.Event()
+
+    def close_browser():
+        closing.set()
+        finish_close.wait(30)
+
+    browser = Mock()
+    browser.close.side_effect = close_browser
+    monkeypatch.setattr('playwright.sync_api.sync_playwright', lambda: nullcontext())
+    monkeypatch.setattr(remote_browser, '_launch', lambda _: browser)
+    monkeypatch.setattr(remote_browser.RemoteSession, '_loop',
+                        lambda session, *_: session.stop.wait(30))
+    monkeypatch.setattr(remote_browser, '_SESSION', None)
+    monkeypatch.setattr(verification, '_sessions', {})
+    monkeypatch.setattr(verification, 'pending', lambda _: {'id': 'test', 'pending': True})
+    monkeypatch.setattr(verification.repo, 'get_account', lambda account_id: {'id': account_id})
+    monkeypatch.setattr(verification.repo, 'account_secret', lambda _: 'test-account')
+
+    remote = remote_browser.attach()
+    verification_path = '/panel/api/accounts/1/verification'
+    try:
+        qr = client.post('/panel/api/login/qr/start', headers=auth, json={})
+        assert qr.status_code == 409
+        assert '即梦浏览器正在使用' in qr.json()['error']['message']
+        assert client.post(f'{verification_path}/start', headers=auth,
+                           json={'purpose': 'account_page'}).status_code == 409
+
+        remote_browser.stop()
+        assert closing.wait(5)
+        ticket = remote_browser.issue_ticket()
+        with client.websocket_connect('/panel/ws/remote?ticket=' + ticket) as ws:
+            assert ws.receive_json()['type'] == 'error'
+        assert client.post('/panel/api/login/qr/start', headers=auth, json={}).status_code == 409
+    finally:
+        remote_browser.stop()
+        finish_close.set()
+        remote.thread.join(5)
+
+    response = client.post(f'{verification_path}/start', headers=auth,
+                           json={'purpose': 'account_page'})
+    assert response.status_code == 200
+    session_id = response.json()['session_id']
+    entry = verification.session(1, session_id)
+    try:
+        assert entry.verification_account_id == 1
+    finally:
+        verification.close(1, session_id)
+        entry.thread.join(5)
