@@ -13,6 +13,7 @@ from .db import DATA, db, now, encrypt_secret, decrypt_secret
 BASE = 'http://127.0.0.1:8300'
 GENERATE_URL = BASE + '/async/v1/images/generations'
 JIMENG_VIDEO_RESOLUTIONS = ('480p', '720p', '1080p')
+VIDEO_RATIOS = ('16:9', '9:16', '1:1', '4:3', '3:4', '21:9')
 JIMENG_VIDEO_MODELS = (
     {'code': 'jimeng-video', 'name': '即梦 Seedance 2.0 mini', 'min': 4, 'max': 15},
     {'code': 'jimeng-video-fast', 'name': '即梦 Seedance 2.0 Fast', 'min': 4, 'max': 15},
@@ -175,7 +176,11 @@ async def generate(model, job, context, set_provider_id):
             payload['image'] = reference
         if job.get('reference_images'):
             payload['image'] = job.pop('reference_images')
-            payload['reference_mode'] = 'multi_image'
+        if payload.get('image'):
+            options = json.loads(job['options_json'])
+            payload['reference_mode'] = options.get('reference_mode') or (
+                'multi_image' if isinstance(payload['image'], list) else 'frames'
+            )
         result = await request_gateway('POST', '/async/v1/images/generations', payload)
         task_id = result['task_id']
         set_provider_id(task_id)

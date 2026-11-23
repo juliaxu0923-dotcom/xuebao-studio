@@ -15,9 +15,9 @@ from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
-from fastapi import FastAPI, HTTPException, Depends, Request, Response, UploadFile, File, Body
+from fastapi import FastAPI, HTTPException, Depends, Query, Request, Response, UploadFile, File, Body
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -26,6 +26,8 @@ from PIL import Image, UnidentifiedImageError
 
 from .db import db, setup_db, now, DATA, ROOT, hash_password, check_password, encrypt_secret
 from .adapters import MEDIA, build_context, invoke_provider, check_provider_url
+from .generated_media import preserve_generated_media
+from .image_sizes import MAX_IMAGE_PIXELS, image_resolution_for_size, image_size_ratio, parse_image_size
 from .resource_usage import ResourceMonitor
 
 WEB = ROOT / 'web'
@@ -34,6 +36,7 @@ COOKIE_NAME = 'yingliu_session'
 Image.MAX_IMAGE_PIXELS = 30_000_000
 MAX_UPLOAD_BYTES = 30 * 1024 * 1024
 MAX_UPLOAD_IMAGE_PIXELS = 4096 * 4096
+IMAGE_UPLOAD_FORMATS = ('JPEG', 'PNG', 'WEBP')
 UPLOAD_CHUNK_BYTES = 256 * 1024
 MAX_JOB_CONCURRENCY = 2
 RESOURCE_SAMPLE_SECONDS = 5
@@ -161,6 +164,8 @@ def prepare_job_references(model, job):
             reference_path = MEDIA / source['result_url'].rsplit('/', 1)[-1]
         else:
             reference_url = source['result_url']
+    if reference_path is not None and not reference_path.is_file():
+        raise ValueError('参考素材文件已丢失')
 
     references = []
     for ref in opts.get('reference_inputs') or []:
@@ -176,6 +181,8 @@ def prepare_job_references(model, job):
             value = source['result_url']
             if value.startswith('/api/media/'):
                 value = build_context(model, job, MEDIA / value.rsplit('/', 1)[-1])['reference_base64']
+            if not value:
+                raise ValueError('参考图片文件已丢失')
         references.append(value)
     if references:
         job['reference_images'] = references
@@ -203,6 +210,7 @@ async def execute_job(job_id):
                           (provider_id, now(), job_id))
 
         url = await invoke_provider(model, job, reference_path, reference_url, set_provider_id)
+        url = await preserve_generated_media(job_id, job['kind'], url)
         with db() as c:
             c.execute("UPDATE jobs SET status='completed',result_url=?,updated_at=? WHERE id=?",
                       (url, now(), job_id))
@@ -477,16 +485,26 @@ def delete_project(project_id: int, user=Depends(whoami)):
     return {'ok': True}
 
 
-def prepare_upload_image(source):
-    formats = ('JPEG', 'PNG', 'WEBP')
-    size_error = f'图片像素不能超过 {MAX_UPLOAD_IMAGE_PIXELS:,}'
+def verify_upload_image(source, max_pixels):
+    size_error = f'图片像素不能超过 {max_pixels:,}'
     try:
-        with Image.open(source, formats=formats) as probe:
-            if probe.width * probe.height > MAX_UPLOAD_IMAGE_PIXELS:
+        with Image.open(source, formats=IMAGE_UPLOAD_FORMATS) as probe:
+            if probe.width * probe.height > max_pixels:
                 raise HTTPException(413, size_error)
+            image_format = probe.format
             probe.verify()
         source.seek(0)
-        rgb = Image.open(source, formats=formats)
+        return image_format
+    except Image.DecompressionBombError as exc:
+        raise HTTPException(413, size_error) from exc
+    except (UnidentifiedImageError, ValueError, SyntaxError, OSError) as exc:
+        raise HTTPException(400, '请上传有效的 JPEG/PNG/WebP 图片') from exc
+
+
+def prepare_upload_image(source):
+    verify_upload_image(source, MAX_UPLOAD_IMAGE_PIXELS)
+    try:
+        rgb = Image.open(source, formats=IMAGE_UPLOAD_FORMATS)
         if rgb.mode != 'RGB':
             original = rgb
             try:
@@ -500,8 +518,6 @@ def prepare_upload_image(source):
         except Exception:
             rgb.close()
             raise
-    except Image.DecompressionBombError as exc:
-        raise HTTPException(413, size_error) from exc
     except (UnidentifiedImageError, ValueError, SyntaxError, OSError) as exc:
         raise HTTPException(400, '请上传有效的 JPEG/PNG/WebP 图片') from exc
 
@@ -522,21 +538,27 @@ def validate_upload_media(source, suffix):
         raise HTTPException(400, f'{kind}文件格式无效')
 
 
-def save_upload(source, user_id, suffix, media_type):
+def save_upload(source, user_id, suffix=None, media_type=None):
     source.seek(0, os.SEEK_END)
     if source.tell() > MAX_UPLOAD_BYTES:
         raise HTTPException(413, '素材不能超过 30MB')
     source.seek(0)
 
+    preserve_image = suffix is None
+    if preserve_image:
+        image_format = verify_upload_image(source, MAX_IMAGE_PIXELS)
+        suffix = {'JPEG': '.jpg', 'PNG': '.png', 'WEBP': '.webp'}[image_format]
+        media_type = Image.MIME[image_format]
     filename = uuid.uuid4().hex + suffix
     destination = MEDIA / filename
     temporary = destination.with_suffix('.part')
     try:
-        if suffix == '.jpg':
+        if suffix == '.jpg' and not preserve_image:
             with prepare_upload_image(source) as image:
                 image.save(temporary, format='JPEG', quality=88)
         else:
-            validate_upload_media(source, suffix)
+            if not preserve_image:
+                validate_upload_media(source, suffix)
             with temporary.open('wb') as output:
                 shutil.copyfileobj(source, output, length=UPLOAD_CHUNK_BYTES)
         temporary.replace(destination)
@@ -569,9 +591,14 @@ async def upload_image(file: UploadFile = File(...), user=Depends(whoami)):
     return await run_in_threadpool(save_upload, file.file, user['id'], suffix, media_type)
 
 
+async def upload_generated_image(file, user):
+    async with app.state.image_upload_lock:
+        return await run_in_threadpool(save_upload, file.file, user['id'])
+
+
 @app.get('/api/media/{filename}')
 def serve_media(filename: str, user=Depends(whoami)):
-    if not re.fullmatch(r'[a-f0-9-]{16,64}\.(png|jpg|mp4|webm|mp3|wav)', filename):
+    if not re.fullmatch(r'[a-f0-9-]{16,64}\.(png|jpg|webp|mp4|webm|mp3|wav)', filename):
         raise HTTPException(404, '文件不存在')
     asset = one('SELECT id FROM assets WHERE filename=? AND user_id=?', (filename, user['id']))
     job = one('SELECT id FROM jobs WHERE result_url=? AND user_id=?',
@@ -581,7 +608,7 @@ def serve_media(filename: str, user=Depends(whoami)):
     p = MEDIA / filename
     if not p.exists():
         raise HTTPException(404, '媒体文件已丢失')
-    return FileResponse(p, media_type={'png': 'image/png', 'jpg': 'image/jpeg', 'mp4': 'video/mp4', 'webm': 'video/webm', 'mp3':'audio/mpeg', 'wav':'audio/wav'}[p.suffix[1:]])
+    return FileResponse(p, media_type={'png': 'image/png', 'jpg': 'image/jpeg', 'webp': 'image/webp', 'mp4': 'video/mp4', 'webm': 'video/webm', 'mp3':'audio/mpeg', 'wav':'audio/wav'}[p.suffix[1:]])
 
 
 class ReferenceInput(BaseModel):
@@ -594,13 +621,15 @@ class CreateJob(BaseModel):
     canvas_node_id: str | None = Field(default=None, max_length=100, pattern=r'^[A-Za-z0-9_-]+$')
     model_id: int
     prompt: str = Field(min_length=1, max_length=8000)
-    ratio: Literal['9:16', '16:9', '1:1', '4:3'] = '9:16'
+    ratio: Literal['9:16', '16:9', '1:1', '4:3', '3:4', '3:2', '2:3', '21:9', 'auto'] = '9:16'
     duration: float = Field(default=5, gt=0, le=30)
-    resolution: Literal['auto', '1K', '2K', '4K', '480p', '720p', '1080p'] = '720p'
+    resolution: Literal['auto', '1K', '2K', '3K', '4K', '480p', '720p', '1080p'] | None = None
+    size: str | None = Field(default=None, max_length=20)
     image_count: int = Field(default=1, ge=1, le=4)
     reference_asset_id: int | None = None
     reference_job_id: str | None = None
     reference_inputs: list[ReferenceInput] = Field(default_factory=list, max_length=9)
+    reference_mode: Literal['frames', 'multi_image', 'end_frame'] | None = None
 
 
 @app.post('/api/jobs')
@@ -608,11 +637,23 @@ async def create_job(data: CreateJob, user=Depends(whoami)):
     model = one('SELECT * FROM models WHERE id=? AND enabled=1', (data.model_id,))
     if not model:
         raise HTTPException(404, '模型不存在或已停用')
-    from .jimeng import is_jimeng, validate_jimeng_duration, validate_jimeng_resolution
-    if is_jimeng(model):
+    dimensions = None
+    if data.size is not None:
+        dimensions = parse_image_size(data.size)
+        if model['kind'] != 'image' or dimensions is None:
+            raise HTTPException(400, '图片尺寸无效，请使用宽x高的像素格式')
+    default_resolution = '1K' if model['kind'] == 'image' else '720p'
+    if dimensions:
+        default_resolution = image_resolution_for_size(*dimensions)
+    resolution = data.resolution or default_resolution
+    from .jimeng import VIDEO_RATIOS, is_jimeng, validate_jimeng_duration, validate_jimeng_resolution
+    jimeng_model = is_jimeng(model)
+    if model['kind'] == 'video' and data.ratio not in VIDEO_RATIOS:
+        raise HTTPException(400, '视频画幅无效')
+    if jimeng_model:
         try:
             validate_jimeng_duration(model, data.duration)
-            validate_jimeng_resolution(model, data.resolution)
+            validate_jimeng_resolution(model, resolution)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
     if data.project_id is not None:
@@ -623,13 +664,14 @@ async def create_job(data: CreateJob, user=Depends(whoami)):
         asset = assert_owner('assets', data.reference_asset_id, user['id'])
         if model['kind'] == 'image' and not asset['mime'].startswith('image/'):
             raise HTTPException(400, '图片生成仅支持图片参考素材')
+        if jimeng_model and not asset['mime'].startswith('image/'):
+            raise HTTPException(400, '当前即梦号池模型仅支持图片参考素材')
     if data.reference_job_id is not None:
         source = assert_owner('jobs', data.reference_job_id, user['id'])
         if source['status'] != 'completed' or source['kind'] != 'image':
             raise HTTPException(400, '只能使用已完成的图片任务作为参考')
     if data.reference_inputs:
-        from .jimeng import is_jimeng
-        if not is_jimeng(model):
+        if not jimeng_model:
             raise HTTPException(400, '此模型尚未接入多图片参考')
         for ref in data.reference_inputs:
             if bool(ref.asset_id) == bool(ref.job_id):
@@ -642,8 +684,27 @@ async def create_job(data: CreateJob, user=Depends(whoami)):
                 source = assert_owner('jobs', ref.job_id, user['id'])
                 if source['kind'] != 'image' or source['status'] != 'completed':
                     raise HTTPException(400, '请选择已完成的图片素材')
+    if data.reference_mode:
+        if not jimeng_model:
+            raise HTTPException(400, '此模型尚未接入该参考模式')
+        single_count = sum(ref is not None for ref in (data.reference_asset_id, data.reference_job_id))
+        if single_count > 1 or (single_count and data.reference_inputs):
+            raise HTTPException(400, '请使用同一种方式提交参考图片')
+        count = len(data.reference_inputs) + single_count
+        if data.reference_mode == 'end_frame' and count != 1:
+            raise HTTPException(400, '仅尾帧模式需要一张图片')
+        if data.reference_mode == 'frames' and count > 2:
+            raise HTTPException(400, '首尾帧最多支持两张图片')
     job_id = uuid.uuid4().hex
     opts = data.model_dump(include={'ratio', 'duration', 'resolution', 'image_count', 'reference_asset_id', 'reference_job_id', 'reference_inputs', 'canvas_node_id'})
+    opts['resolution'] = resolution
+    if data.reference_mode:
+        opts['reference_mode'] = data.reference_mode
+    if dimensions:
+        width, height = dimensions
+        opts['size'] = f'{width}x{height}'
+        if 'ratio' not in data.model_fields_set or data.ratio == 'auto':
+            opts['ratio'] = image_size_ratio(width, height)
     cost = model['cost']
     with db() as c:
         c.execute('BEGIN IMMEDIATE')
@@ -663,10 +724,26 @@ async def create_job(data: CreateJob, user=Depends(whoami)):
 
 
 @app.get('/api/jobs')
-def jobs(user=Depends(whoami)):
+def jobs(kind: Literal['image', 'video'] | None = None,
+         limit: Annotated[int, Query(ge=1, le=100)] = 100,
+         before: Annotated[str | None, Query(min_length=1, max_length=100)] = None,
+         user=Depends(whoami)):
+    user_id = user['id']
+    filters = ['j.user_id=?', 'j.deleted=0']
+    params = [user_id]
+    if kind:
+        filters.append('j.kind=?')
+        params.append(kind)
+    if before:
+        cursor = one('SELECT created_at,rowid,kind FROM jobs WHERE id=? AND user_id=?', (before, user_id))
+        if not cursor or (kind and cursor['kind'] != kind):
+            raise HTTPException(404, '生成记录不存在')
+        filters.append('(j.created_at,j.rowid)<(?,?)')
+        params.extend((cursor['created_at'], cursor['rowid']))
+    params.append(limit)
     return [present_job(j) for j in allrows(
-        '''SELECT j.*, m.name AS model_name FROM jobs j JOIN models m ON m.id=j.model_id
-           WHERE j.user_id=? AND j.deleted=0 ORDER BY j.created_at DESC LIMIT 100''', (user['id'],))]
+        'SELECT j.*,m.name AS model_name FROM jobs j LEFT JOIN models m ON m.id=j.model_id '
+        'WHERE ' + ' AND '.join(filters) + ' ORDER BY j.created_at DESC,j.rowid DESC LIMIT ?', params)]
 
 
 @app.delete('/api/jobs/{job_id}')

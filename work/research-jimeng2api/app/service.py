@@ -492,7 +492,8 @@ def _create_video_task(*, api_key_id: int | None, model: str, prompt: str,
             f"{vm.name} 支持 {vm.duration_min}–{vm.duration_max}s，"
             f"已将 {requested_sec}s 调整为 {sec}s")
 
-    res = (resolution or "").strip().lower()
+    requested_res = (resolution or "").strip().lower()
+    res = requested_res
     if res not in vm.resolutions:
         if res:
             degradations.append(
@@ -507,12 +508,15 @@ def _create_video_task(*, api_key_id: int | None, model: str, prompt: str,
                 f"不支持比例 {asp}（可选 {list(video.ASPECT_RATIOS)}），改用 16:9")
         asp = "16:9"
 
-    # 图生视频：0 张 = 文生视频，1 张 = 首帧，2 张 = 首帧 + 尾帧。
-    # 超过 2 张直接拒 —— 多出来的那几张没有语义，静默丢掉会让用户以为生效了。
+    # 普通帧模式按首帧、尾帧顺序取图，尾帧模式只接收一张图。
     frames = [x for x in (images or []) if x]
-    if reference_mode not in ('frames', 'multi_image'):
+    if reference_mode not in ('frames', 'multi_image', 'end_frame'):
         raise JimengParamError('未知参考模式', kind='param')
-    if len(frames) > (9 if reference_mode == 'multi_image' else 2):
+    if reference_mode == 'end_frame' and len(frames) != 1:
+        raise JimengParamError('尾帧模式需要且仅支持一张参考图片', kind='param')
+    if reference_mode == 'multi_image' and len(frames) > 9:
+        raise JimengParamError('多素材参考最多支持九张图片', kind='param')
+    if reference_mode == 'frames' and len(frames) > 2:
         raise JimengParamError(
             "视频最多两张图：第 1 张作首帧、第 2 张作尾帧（多传无意义）",
             kind="param")
@@ -524,7 +528,7 @@ def _create_video_task(*, api_key_id: int | None, model: str, prompt: str,
         image_uris=frames, mask_uri="",
         degradations=degradations,
         extras={"video": {"duration_ms": sec * 1000, "aspect_ratio": asp, "reference_mode": reference_mode,
-                          "duration_s": sec}},
+                          "duration_s": sec, "requested_resolution": requested_res if res == requested_res else ""}},
     )
 
 
@@ -962,7 +966,8 @@ def _submit(account_id: int, task: dict, uris: list[str]) -> str:
             raise JimengParamError(f"未知视频模型 {task['model']!r}", kind="param")
         ex = (task.get("extras") or {}).get("video") or {}
         refs = [x for x in (task.get("image_uris") or []) if x]
-        if ex.get('reference_mode') == 'multi_image':
+        reference_mode = ex.get('reference_mode')
+        if reference_mode == 'multi_image':
             materials = []
             for ref in refs:
                 uri, width, height = _upload_one(account_id, ref)
@@ -976,7 +981,11 @@ def _submit(account_id: int, task: dict, uris: list[str]) -> str:
         if refs:
             # `tos-` 直传拿不到尺寸（上游 `image_by_uri` 也回 0），传 0 由上游自己读
             uri, w, h = _upload_one(account_id, refs[0])
-            first = video.frame_node(uri, w, h)
+            frame = video.frame_node(uri, w, h)
+            if reference_mode == 'end_frame':
+                end = frame
+            else:
+                first = frame
         if len(refs) > 1:
             uri, w, h = _upload_one(account_id, refs[1])
             end = video.frame_node(uri, w, h)
@@ -1026,7 +1035,16 @@ def poll_once() -> None:
     for account_id, group in by_account.items():
         try:
             rt = pool_mod.pool.runtime(account_id)
-            result = rt.client.fetch_many([t["id"] for t in group])
+            ids = [t["id"] for t in group]
+            video_resolutions = {}
+            for task in group:
+                video_options = (task.get("extras") or {}).get("video") or {}
+                if requested := video_options.get("requested_resolution"):
+                    video_resolutions[task["id"]] = requested
+            if video_resolutions:
+                result = rt.client.fetch_many(ids, video_resolutions=video_resolutions)
+            else:
+                result = rt.client.fetch_many(ids)
         except JimengError as e:
             if e.kind in ("auth", "quota"):
                 repo.record_account_result(account_id, ok=False, error=str(e),

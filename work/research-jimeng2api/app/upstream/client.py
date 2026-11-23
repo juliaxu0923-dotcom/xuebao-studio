@@ -315,16 +315,18 @@ class JimengClient:
         return submit_id
 
     # ------------------------------------------------------------- 任务查询
-    def fetch_many(self, submit_ids: list[str]) -> dict[str, dict]:
+    def fetch_many(self, submit_ids: list[str], *,
+                   video_resolutions: dict[str, str] | None = None) -> dict[str, dict]:
         ids = [s for s in submit_ids if s]
         if not ids:
             return {}
         data = self._post(PATH_HISTORY, {"submit_ids": ids}).get("data") or {}
+        resolutions = video_resolutions or {}
         out: dict[str, dict] = {}
         for sid in ids:
             node = data.get(sid)
             if isinstance(node, dict):
-                out[sid] = protocol.parse_task(sid, node)
+                out[sid] = protocol.parse_task(sid, node, video_resolution=resolutions.get(sid))
             else:
                 out[sid] = {
                     "submit_id": sid, "status": 0, "status_name": "init",

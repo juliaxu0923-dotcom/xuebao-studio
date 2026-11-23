@@ -14,6 +14,7 @@ from PIL import Image
 from starlette.concurrency import run_in_threadpool
 
 from .db import db, now, ROOT
+from .image_sizes import IMAGE_RATIOS, IMAGE_RESOLUTIONS, parse_image_size
 
 RUNTIME = ROOT.parent / 'infinite-inspect/resources/app/web'
 RENDERER = 'http://127.0.0.1:8001'
@@ -50,6 +51,93 @@ def setup_canvas_bridge():
 
 def envelope(data):
     return {'code': 0, 'data': data, 'msg': ''}
+
+
+def canvas_image_options(data):
+    size = str(data.get('size') or '').strip()
+    ratio = str(data.get('aspect_ratio') or data.get('ratio') or '').strip()
+    resolution = str(data.get('resolution_name') or data.get('resolution') or '').strip().upper()
+    if ratio and ratio not in (*IMAGE_RATIOS, 'auto'):
+        raise HTTPException(400, '图片画幅无效')
+    if resolution and resolution not in IMAGE_RESOLUTIONS and resolution != 'AUTO':
+        raise HTTPException(400, '图片分辨率无效')
+
+    dimensions = None
+    if size.upper() in IMAGE_RESOLUTIONS:
+        resolution = resolution or size.upper()
+    elif size.lower() == 'auto' or size in IMAGE_RATIOS:
+        ratio = ratio or size.lower()
+    elif size:
+        dimensions = parse_image_size(size)
+        if dimensions is None:
+            raise HTTPException(400, '图片尺寸无效，请使用宽x高的像素格式')
+
+    if dimensions:
+        options = {'size': size}
+    else:
+        options = {'ratio': '1:1', 'resolution': 'auto'}
+    if ratio:
+        options['ratio'] = ratio
+    if resolution:
+        options['resolution'] = 'auto' if resolution == 'AUTO' else resolution
+    return options
+
+
+def canvas_video_options(data):
+    from .jimeng import VIDEO_RATIOS
+
+    ratio = str(data.get('size') or data.get('aspect_ratio') or data.get('ratio') or '1:1').strip()
+    if ratio not in VIDEO_RATIOS:
+        dimensions = parse_image_size(ratio)
+        if dimensions:
+            width, height = dimensions
+            ratios = {value: tuple(map(int, value.split(':'))) for value in VIDEO_RATIOS}
+            ratio = min(ratios, key=lambda value: abs(width / height - ratios[value][0] / ratios[value][1]))
+        elif ratio == 'auto':
+            ratio = '1:1'
+        else:
+            raise HTTPException(400, '视频画幅无效')
+    resolution = str(data.get('resolution_name') or data.get('resolution') or '720p').strip().lower()
+    if resolution in ('480', '720', '1080'):
+        resolution += 'p'
+    if resolution not in ('480p', '720p', '1080p'):
+        raise HTTPException(400, '视频分辨率无效')
+    try:
+        duration = float(data.get('seconds', data.get('duration', 5)))
+    except (ValueError, TypeError):
+        raise HTTPException(400, '必须输入视频秒数') from None
+    if duration > 30:
+        raise HTTPException(400, '需要在30秒以内')
+    if not 0 < duration <= 30:
+        raise HTTPException(400, '视频秒数必须大于0')
+    return {'ratio': ratio, 'resolution': resolution, 'duration': duration}
+
+
+def canvas_references(data, form):
+    fields = ('first_frame_url', 'last_frame_url', 'input_reference[]', 'video_reference[]', 'audio_reference[]',
+              'image', 'image_url', 'video_url', 'audio_url', 'reference_video', 'reference_audio')
+    references = []
+    for field in fields:
+        values = form.getlist(field) if form is not None else data.get(field, [])
+        if not isinstance(values, list):
+            values = [values]
+        references.extend((field, value) for value in values if
+                          (isinstance(value, str) and value) or hasattr(value, 'filename'))
+    if form is not None:
+        references.extend((field, value) for field, value in form.multi_items()
+                          if field not in fields and hasattr(value, 'filename'))
+    return references
+
+
+def jimeng_reference_mode(references):
+    fields = [field for field, _ in references]
+    if 'first_frame_url' in fields or 'last_frame_url' in fields:
+        if len(fields) != len(set(fields)) or set(fields) - {'first_frame_url', 'last_frame_url'}:
+            raise HTTPException(400, '请选择首尾帧或多图参考中的一种方式')
+        return 'frames' if 'first_frame_url' in fields else 'end_frame'
+    if 'input_reference[]' in fields or len(fields) > 1:
+        return 'multi_image'
+    return None
 
 
 def legacy_canvas(p):
@@ -184,7 +272,8 @@ def register(app, api):
     @app.get('/api/files/{asset_id}')
     def file_info(asset_id: int, user=Depends(whoami)):
         asset = api['assert_owner']('assets', asset_id, user['id'])
-        return envelope({'url': '/api/media/' + asset['filename'], 'storageKey': 'server:' + str(asset_id)})
+        return envelope({'url': '/api/media/' + asset['filename'], 'storageKey': 'server:' + str(asset_id),
+                         'mime': asset['mime']})
 
     @app.get('/api/proxy-image')
     async def proxy_generated_media(url: str, user=Depends(whoami)):
@@ -218,8 +307,9 @@ def register(app, api):
             spool.close()
             raise
 
-    async def upload(file, user):
-        result = await api['upload_image'](file, user)
+    async def upload(file, user, *, preserve_image=False):
+        upload_file = api['upload_generated_image'] if preserve_image else api['upload_image']
+        result = await upload_file(file, user)
         asset = api['assert_owner']('assets', result['id'], user['id'])
         path = api['MEDIA'] / asset['filename']
         width = height = 0
@@ -228,6 +318,24 @@ def register(app, api):
                 width, height = image.size
         return {**result, 'storageKey': 'server:' + str(result['id']), 'width': width,
                 'height': height, 'bytes': path.stat().st_size, 'mimeType': asset['mime']}
+
+    async def resolve_reference(source, user):
+        if hasattr(source, 'filename'):
+            return {'asset_id': (await upload(source, user))['id']}
+        path = urlparse(source).path
+        if path.startswith('/api/media/'):
+            asset = one('SELECT id FROM assets WHERE user_id=? AND filename=?',
+                        (user['id'], path.rsplit('/', 1)[-1]))
+            if asset:
+                return {'asset_id': asset['id']}
+        if re.fullmatch(r'/api/files/\d+/content', path):
+            asset = api['assert_owner']('assets', path.split('/')[3], user['id'])
+            return {'asset_id': asset['id']}
+        job = one("SELECT id FROM jobs WHERE user_id=? AND result_url=? AND status='completed' AND kind='image'",
+                  (user['id'], source))
+        if job:
+            return {'job_id': job['id']}
+        raise HTTPException(400, '请先将参考素材上传到雪宝')
 
     def task_view(job, kind):
         model = one('SELECT model_code FROM models WHERE id=?', (job['model_id'],))
@@ -272,7 +380,12 @@ def register(app, api):
             saved = one('SELECT body FROM infinite_user_data WHERE user_id=? AND name=?', (user['id'], path))
             return envelope(json.loads(saved['body']) if saved else None)
         if path == 'files' and method == 'POST':
-            return envelope(await upload(form['file'], user))
+            generated_url = form.get('generated_image_url')
+            generated_image = isinstance(generated_url, str) and generated_url and one(
+                "SELECT id FROM jobs WHERE user_id=? AND result_url=? AND kind='image' AND status='completed'",
+                (user['id'], generated_url),
+            )
+            return envelope(await upload(form['file'], user, preserve_image=bool(generated_image)))
         if path.startswith('files/') and method == 'DELETE':
             # Canvas removal does not destroy media still referenced by another project or job.
             api['assert_owner']('assets', path.split('/')[-1], user['id'])
@@ -292,6 +405,7 @@ def register(app, api):
                 model = one('SELECT * FROM models WHERE id=? AND model_code=? AND kind=? AND enabled=1 AND deleted=0', (channel_id, data.get('model'), kind))
             if not model:
                 raise HTTPException(400, '模型未配置或已停用')
+            generation_options = canvas_image_options(data) if kind == 'image' else canvas_video_options(data)
             cid = request.headers.get('X-Studio-Project-ID') or (form.get('_canvas_source_id') if form is not None else body.get('sourceId'))
             project = owned_canvas(str(cid), user) if cid else None
             node_id = request.headers.get('X-Video-Task-Source-ID') if kind == 'video' else None
@@ -302,94 +416,26 @@ def register(app, api):
                 if saved:
                     with db() as c:
                         link_video_jobs(c, json.loads(saved['body']), project['id'], user['id'])
-            files = [value for _, value in form.multi_items() if hasattr(value, 'filename')] if form is not None else []
-            reference_fields = ('input_reference[]', 'first_frame_url', 'last_frame_url', 'image', 'image_url', 'video_url', 'audio_url', 'reference_video', 'reference_audio')
-            addresses = []
-            for key in reference_fields:
-                values = form.getlist(key) if form is not None else data.get(key, [])
-                if not isinstance(values, list):
-                    values = [values]
-                addresses.extend(value for value in values if isinstance(value, str) and value)
             from .jimeng import is_jimeng
-            multi = len(files) + len(addresses) > 1
-            if multi and not is_jimeng(model):
+            references = canvas_references(data, form)
+            jimeng_model = is_jimeng(model)
+            if len(references) > 1 and not jimeng_model:
                 raise HTTPException(400, '当前模型尚未接入多素材参考')
-            if len(files) + len(addresses) > 9:
+            if len(references) > 9:
                 raise HTTPException(400, '多人物参考最多支持 9 张图片')
-            reference_inputs = []
-            if multi:
-                for file in files:
-                    reference_inputs.append({'asset_id': (await upload(file, user))['id']})
-                for address in addresses:
-                    path = urlparse(address).path
-                    asset = one('SELECT id FROM assets WHERE user_id=? AND filename=?', (user['id'], path.rsplit('/',1)[-1])) if path.startswith('/api/media/') else None
-                    if asset:
-                        reference_inputs.append({'asset_id': asset['id']})
-                    elif re.fullmatch(r'/api/files/\d+/content', path):
-                        reference_inputs.append({'asset_id': api['assert_owner']('assets', path.split('/')[3], user['id'])['id']})
-                    else:
-                        source = one("SELECT id FROM jobs WHERE user_id=? AND result_url=? AND status='completed' AND kind='image'", (user['id'], address))
-                        if not source:
-                            raise HTTPException(400, '请先将参考图片上传到雪宝')
-                        reference_inputs.append({'job_id': source['id']})
-                files, addresses = [], []
-            ref_id = (await upload(files[0], user))['id'] if files else None
-            ref_job_id = None
-            if addresses:
-                address = addresses[0]
-                path = urlparse(address).path
-                asset = one('SELECT id FROM assets WHERE user_id=? AND filename=?', (user['id'], path.rsplit('/', 1)[-1])) if path.startswith('/api/media/') else None
-                if asset:
-                    ref_id = asset['id']
-                elif re.fullmatch(r'/api/files/\d+/content', path):
-                    ref_id = api['assert_owner']('assets', path.split('/')[3], user['id'])['id']
+            reference_mode = jimeng_reference_mode(references) if jimeng_model else None
+            if kind == 'video' and not jimeng_model and any(field == 'last_frame_url' for field, _ in references):
+                raise HTTPException(400, '当前模型尚未接入尾帧参考')
+            if references:
+                resolved = [await resolve_reference(source, user) for _, source in references]
+                if reference_mode and (len(resolved) > 1 or reference_mode != 'frames'):
+                    generation_options.update(reference_mode=reference_mode, reference_inputs=resolved)
                 else:
-                    source = one("SELECT id FROM jobs WHERE user_id=? AND result_url=? AND status='completed' AND kind='image'", (user['id'], address))
-                    if not source:
-                        raise HTTPException(400, '请先将参考图片上传到雪宝')
-                    ref_job_id = source['id']
-            size = str(data.get('size') or data.get('aspect_ratio') or '1:1')
-            ratio = size if size in ('1:1', '9:16', '16:9', '4:3') else '1:1'
-            if 'x' in size:
-                try:
-                    w, h = map(int, size.split('x'))
-                    ratio = min(('1:1', '9:16', '16:9', '4:3'), key=lambda r: abs(w / h - int(r.split(':')[0]) / int(r.split(':')[1])))
-                except (ValueError, ZeroDivisionError):
-                    pass
-            seconds = data.get('seconds', data.get('duration', 5))
-            if seconds is None or str(seconds).strip() == '':
-                raise HTTPException(400, '必须输入视频秒数')
-            try:
-                seconds = float(seconds)
-            except (ValueError, TypeError):
-                raise HTTPException(400, '必须输入视频秒数')
-            if seconds > 30:
-                raise HTTPException(400, '需要在30秒以内')
-            if not 0 < seconds <= 30:
-                raise HTTPException(400, '视频秒数必须大于0')
-            from .jimeng import is_jimeng
-            if is_jimeng(model):
-                from .jimeng import validate_jimeng_duration
-                try:
-                    validate_jimeng_duration(model, seconds)
-                except ValueError as exc:
-                    raise HTTPException(400, str(exc)) from exc
-                if ref_id:
-                    reference = api['assert_owner']('assets', ref_id, user['id'])
-                    if not reference['mime'].startswith('image/'):
-                        raise HTTPException(400, '当前即梦号池模型仅支持图片首帧参考，视频和音频参考尚未接入')
-            resolution = 'auto'
-            if kind == 'video':
-                resolution = str(data.get('resolution_name') or data.get('resolution') or '720p').strip().lower()
-                if resolution in ('480', '720', '1080'):
-                    resolution += 'p'
-                if resolution not in ('480p', '720p', '1080p'):
-                    raise HTTPException(400, '视频分辨率无效')
+                    generation_options.update(reference_asset_id=resolved[0].get('asset_id'),
+                                              reference_job_id=resolved[0].get('job_id'))
             job = await api['create_job'](api['CreateJob'](project_id=project['id'] if project else None,
                 canvas_node_id=node_id if project else None,
-                model_id=model['id'], prompt=str(data.get('prompt') or body.get('prompt') or ''), ratio=ratio,
-                duration=seconds,
-                resolution=resolution, reference_asset_id=ref_id, reference_job_id=ref_job_id, reference_inputs=reference_inputs), user)
+                model_id=model['id'], prompt=str(data.get('prompt') or body.get('prompt') or ''), **generation_options), user)
             return envelope(task_view(api['assert_owner']('jobs', job['id'], user['id']), kind))
         return Response(json.dumps({'code': 400, 'msg': '此功能尚未接入雪宝，请使用图片或视频生成', 'data': None}), status_code=400, media_type='application/json')
 
@@ -412,13 +458,13 @@ def register(app, api):
         content_type = result.headers.get('content-type', 'text/html')
         # Next assets use immutable caching. A patched bundle needs a new URL,
         # including references inside the server-rendered hydration payload.
-        content = content.replace(b'0iqtaf0ai17gn.js', b'0iqtaf0ai17gn-studio-copy-v2.js')
-        content = content.replace(b'1_tj89_8ipyt2.js', b'1_tj89_8ipyt2-studio-model-names-v1.js')
+        content = content.replace(b'0iqtaf0ai17gn.js', b'0iqtaf0ai17gn-studio-copy-v3.js')
+        content = content.replace(b'1_tj89_8ipyt2.js', b'1_tj89_8ipyt2-studio-image-sizes-v1.js')
         content = content.replace(b'20g6bk7ya_8li.js', b'20g6bk7ya_8li-studio-model-names-v1.js')
         for name in ASSET_PICKER_CHUNKS:
             content = content.replace((name + '.js').encode(), (name + '-studio-assets-v1.js').encode())
         for name in ('1e3il75m4m7o5', '2ln7-76yya1ga'):
-            content = content.replace((name + '.js').encode(), (name + '-studio-video-v2.js').encode())
+            content = content.replace((name + '.js').encode(), (name + '-studio-video-v3.js').encode())
         if 'text/html' in content_type:
             bootstrap = '<link rel="stylesheet" href="/static/infinite-bridge.css?v=model-names-v1"><script src="/static/infinite-bridge.js" data-user="' + str(user['id']) + '"></script>'
             bootstrap += '<link rel="stylesheet" href="/static/canvas-reference-picker.css?v=5"><script src="/static/canvas-reference-picker.js?v=5"></script>'
@@ -458,6 +504,7 @@ def register(app, api):
 
         @app.get('/_next/static/chunks/{name}-studio-video-v1.js')
         @app.get('/_next/static/chunks/{name}-studio-video-v2.js')
+        @app.get('/_next/static/chunks/{name}-studio-video-v3.js')
         def studio_video_settings(name: str):
             if name not in ('1e3il75m4m7o5', '2ln7-76yya1ga'):
                 raise HTTPException(404)
@@ -467,6 +514,32 @@ def register(app, api):
             source = source[:start] + source[end:]
             source = source.replace('e.videoSeconds||"6"', 'e.videoSeconds??"6"')
             source = source.replace('value:e,onChange:e=>n(e.target.value),onBlur:e=>a?.(e.target.value)', '''value:e,"aria-label":"视频秒数",step:"any",required:true,onChange:e=>{e.target.setCustomValidity("");n(e.target.value)},onBlur:e=>{const v=e.target.value;const error=v.trim()===""?"必须输入视频秒数":Number(v)>30?"需要在30秒以内":Number(v)<=0?"视频秒数必须大于0":"";e.target.setCustomValidity(error);if(error)e.target.reportValidity()}''')
+            size_payload = 'M&&$.append("size",M),$.append("resolution_name",es(t.vquality))'
+            if source.count(size_payload) != 1:
+                raise HTTPException(503, '画布视频画幅适配需要更新')
+            # Studio also accepts literal ratios, which the request builder would otherwise convert to 16:9 or 9:16.
+            source = source.replace(size_payload,
+                'x(t)&&/^(?:16:9|9:16|1:1|4:3|3:4|21:9)$/.test(t.size)?$.append("size",t.size):' + size_payload)
+            token51_panel = (
+                'function h({config:e,modelName:i,onConfigChange:o,theme:n,showTitle:a,className:l,visualOnly:s})'
+                '{let d=i||e.videoModel,u=(0,c.token51VideoModelCaps)(d),m=(0,c.normalizeToken51VideoRatio)(e.size),'
+                'f=(0,c.normalizeToken51VideoDuration)(d,e.videoSeconds),'
+                'p=(0,c.normalizeToken51VideoResolution)(d,e.vquality||"720p"),g=u.resolutions||["720p"];'
+            )
+            if source.count(token51_panel) != 1:
+                raise HTTPException(503, '画布即梦视频设置适配需要更新')
+            source = source.replace(token51_panel, '''function studioJimengVideoRatio(size){
+                return size==="auto"?"1:1":(0,l.normalizeSeedanceRatio)(size||"1280x720");
+            }
+            function h({config:e,modelName:i,onConfigChange:o,theme:n,showTitle:a,className:l,visualOnly:s}){
+                const d=i||e.videoModel,u=(0,c.token51VideoModelCaps)(d);
+                const jimeng=/^jimeng-video(?:$|-)/.test(d),quality=String(e.vquality||"720p");
+                const value=quality.trim().replace(/p$/i,"")||"720";
+                const displayQuality=!jimeng?quality:quality==="low"?"480p":
+                    ["auto","medium","high"].includes(quality)?"720p":/k$/i.test(value)?value.toLowerCase():value+"p";
+                const m=(0,c.normalizeToken51VideoRatio)(jimeng?studioJimengVideoRatio(e.size):e.size);
+                const f=(0,c.normalizeToken51VideoDuration)(d,e.videoSeconds);
+                const p=(0,c.normalizeToken51VideoResolution)(d,displayQuality),g=u.resolutions||["720p"];''')
             return Response(source, media_type='application/javascript', headers={'cache-control':'no-store'})
 
         @app.get('/_next/static/chunks/1e3il75m4m7o5.js')
@@ -481,6 +554,7 @@ def register(app, api):
         @app.get('/_next/static/chunks/0iqtaf0ai17gn-studio-ref-v6.js')
         @app.get('/_next/static/chunks/0iqtaf0ai17gn-studio-copy-v1.js')
         @app.get('/_next/static/chunks/0iqtaf0ai17gn-studio-copy-v2.js')
+        @app.get('/_next/static/chunks/0iqtaf0ai17gn-studio-copy-v3.js')
         @app.get('/_next/static/chunks/0iqtaf0ai17gn-studio-ref-v2.js')
         def studio_reference_picker():
             source = (RUNTIME / '.next/static/chunks/0iqtaf0ai17gn.js').read_text(encoding='utf-8')
@@ -591,18 +665,20 @@ def register(app, api):
             source = source.replace('c.metadata?.seconds||d.videoSeconds||en.defaultConfig.videoSeconds', 'c.metadata?.seconds??d.videoSeconds??en.defaultConfig.videoSeconds')
             source = source.replace('g.metadata?.seconds||f.videoSeconds||en.defaultConfig.videoSeconds', 'g.metadata?.seconds??f.videoSeconds??en.defaultConfig.videoSeconds')
             for name in ('1e3il75m4m7o5', '2ln7-76yya1ga'):
-                source = source.replace(name + '.js', name + '-studio-video-v2.js')
+                source = source.replace(name + '.js', name + '-studio-video-v3.js')
             return Response(source, media_type='application/javascript', headers={'cache-control': 'no-store'})
 
         @app.get('/_next/static/chunks/1_tj89_8ipyt2.js')
         @app.get('/_next/static/chunks/1_tj89_8ipyt2-studio-resolutions-v1.js')
         @app.get('/_next/static/chunks/1_tj89_8ipyt2-studio-resolutions-v2.js')
         @app.get('/_next/static/chunks/1_tj89_8ipyt2-studio-model-names-v1.js')
+        @app.get('/_next/static/chunks/1_tj89_8ipyt2-studio-image-sizes-v1.js')
         @app.get('/_next/static/chunks/20g6bk7ya_8li.js')
         @app.get('/_next/static/chunks/20g6bk7ya_8li-studio-model-names-v1.js')
         def studio_model_channels(request: Request):
             name = request.url.path.rsplit('/', 1)[-1]
             name = name.replace('-studio-resolutions-v1', '').replace('-studio-resolutions-v2', '').replace('-studio-model-names-v1', '')
+            name = name.replace('-studio-image-sizes-v1', '')
             source = (RUNTIME / '.next/static/chunks' / name).read_text(encoding='utf-8')
             # Restore account channels and remove the desktop build's single-vendor video filter.
             if name == '1_tj89_8ipyt2.js':
@@ -613,6 +689,12 @@ def register(app, api):
                     'resolutions': list(JIMENG_VIDEO_RESOLUTIONS), 'maxReferences': 9,
                 }, ensure_ascii=False, separators=(',', ':')) for item in JIMENG_VIDEO_MODELS)
                 patches = [
+                    # Generated images already have a job URL, so preserve the pixels when syncing to assets.
+                    ('return await C(e,"image")', 'return await C(e,"image",true)'),
+                    ('async function C(e,t){let o=await fetch(I(e))',
+                     'async function C(e,t,generated=false){let o=await fetch(I(e))'),
+                    ('m.append("file",r,t||"image-"+(0,a.nanoid)()+"."+O(r.type)),d&&m.append',
+                     'm.append("file",r,t||"image-"+(0,a.nanoid)()+"."+O(r.type)),generated&&m.append("generated_image_url",e),d&&m.append'),
                     ('})(e,a,!1),[e,a])', '})(e,a,!0),[e,a])'),
                     ('maxReferences:9}],p=["1:1","3:4","4:3","9:16","16:9","21:9"];',
                      'maxReferences:9},' + supported + '],p=["1:1","3:4","4:3","9:16","16:9","21:9"];'),

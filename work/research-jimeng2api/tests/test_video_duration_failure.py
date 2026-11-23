@@ -40,7 +40,7 @@ def test_legacy_message_and_structured_failure_have_same_public_result():
 def test_poll_preserves_failure_reason_and_account_usable(monkeypatch):
     account_id = repo.add_account('duration-test-session')
     repo.update_account(account_id, status='ok', credits=1000)
-    task = service.create_task(api_key_id=None, model='jimeng-video', prompt='test',
+    task = service.create_task(api_key_id=None, model='jimeng-video-25', prompt='test',
                                size='', count=1, duration=25)
     monkeypatch.setattr(service, '_submit', lambda aid, task, uris: task['id'])
     service.submit_task(repo.get_task(task['id']))

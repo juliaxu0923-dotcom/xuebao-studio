@@ -16,10 +16,15 @@ import hashlib
 import httpx
 from PIL import Image, ImageDraw, ImageFont
 from .db import DATA, decrypt_secret
+from .image_sizes import IMAGE_RESOLUTIONS, gpt_image_2_dimensions, image_dimensions
 
 MEDIA = DATA / 'media'
 MEDIA.mkdir(parents=True, exist_ok=True)
 TOKENS = re.compile(r'\{\{\s*([\w.]+)\s*\}\}')
+BASE_REQUEST_TEMPLATE = {'model': '{{model}}', 'prompt': '{{prompt}}'}
+DEFAULT_IMAGE_TEMPLATE = {**BASE_REQUEST_TEMPLATE, 'aspect_ratio': '{{ratio}}'}
+REFERENCE_TOKENS = ('reference_image', 'reference_base64', 'reference_video_base64', 'reference_audio_base64')
+VIDEO_HEIGHTS = {'480p': 480, '720p': 720, '1080p': 1080}
 
 
 def read_path(value, path):
@@ -91,12 +96,17 @@ def build_context(model, job, reference_path=None, reference_url=None):
     options = json.loads(job['options_json'])
     ratio = options.get('ratio', '9:16')
     duration = options.get('duration', 5)
+    is_image = job.get('kind', model.get('kind')) == 'image'
     context = {
         'prompt': job['prompt'], 'model': model['model_code'],
         'ratio': ratio, 'duration': duration,
-        'resolution': options.get('resolution', '720p'), 'n': options.get('image_count', 1),
+        'resolution': options.get('resolution') or ('1K' if is_image else '720p'),
+        'n': options.get('image_count', 1),
         'reference_image': reference_url or '', 'reference_base64': '', 'reference_video_base64': '', 'reference_audio_base64': '',
     }
+    if is_image:
+        width, height = image_dimensions(ratio, context['resolution'], options.get('size'))
+        context.update(size=f'{width}x{height}', width=width, height=height)
     if reference_path:
         p = Path(reference_path)
         if p.exists():
@@ -106,11 +116,15 @@ def build_context(model, job, reference_path=None, reference_url=None):
     return context
 
 
-def make_demo_image(job_id, prompt, ratio, is_video=False):
-    sizes = {'9:16': (576, 1024), '16:9': (1024, 576), '1:1': (800, 800), '4:3': (960, 720)}
-    width, height = sizes.get(ratio, (576, 1024))
+def make_demo_image(job_id, prompt, ratio, is_video=False, *, resolution='auto', size=None):
     if is_video:
-        width, height = (640, 360) if ratio == '16:9' else (360, 640)
+        short_edge = VIDEO_HEIGHTS.get(resolution, 360)
+        horizontal, vertical = map(int, ratio.split(':'))
+        scale = short_edge / min(horizontal, vertical)
+        width = 2 * round(horizontal * scale / 2)
+        height = 2 * round(vertical * scale / 2)
+    else:
+        width, height = image_dimensions(ratio, resolution, size)
     key = hashlib.sha256(prompt.encode()).digest()
     img = Image.new('RGB', (width, height))
     dr = ImageDraw.Draw(img)
@@ -136,9 +150,9 @@ def make_demo_image(job_id, prompt, ratio, is_video=False):
     return filename
 
 
-async def make_demo_video(job_id, prompt, ratio):
-    """Generate a short, explicitly watermarked animation for UI testing."""
-    filename = make_demo_image(job_id, prompt, ratio, is_video=True)
+async def make_demo_video(job_id, prompt, ratio, *, duration=3, resolution='auto'):
+    """Generate a watermarked preview with the requested video settings."""
+    filename = await asyncio.to_thread(make_demo_image, job_id, prompt, ratio, True, resolution=resolution)
     video_name = f'{job_id}.mp4'
     destination = MEDIA / video_name
     temporary = destination.with_suffix('.part.mp4')
@@ -147,9 +161,10 @@ async def make_demo_video(job_id, prompt, ratio):
         from imageio_ffmpeg import get_ffmpeg_exe
         ffmpeg = get_ffmpeg_exe()
     cmd = [ffmpeg, '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
-           '-loop', '1', '-framerate', '12', '-threads', '1', '-i', str(MEDIA / filename),
+           '-framerate', '12', '-threads', '1', '-i', str(MEDIA / filename),
            '-filter_threads', '1',
-           '-t', '3', '-vf', 'format=yuv420p', '-c:v', 'libx264', '-preset', 'ultrafast',
+           '-t', str(duration), '-vf', f'tpad=stop_mode=clone:stop_duration={duration},format=yuv420p',
+           '-c:v', 'libx264', '-preset', 'ultrafast',
            '-threads', '1', '-movflags', '+faststart', str(temporary)]
     try:
         process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.DEVNULL,
@@ -178,9 +193,15 @@ async def invoke_provider(model, job, reference_path, reference_url, set_provide
     if model['protocol'] == 'demo':
         await asyncio.sleep(1)
         if job['kind'] == 'image':
-            filename = make_demo_image(job['id'], job['prompt'], options.get('ratio', '9:16'))
+            filename = await asyncio.to_thread(
+                make_demo_image, job['id'], job['prompt'], options.get('ratio', '9:16'),
+                resolution=options.get('resolution', 'auto'), size=options.get('size'),
+            )
         else:
-            filename = await make_demo_video(job['id'], job['prompt'], options.get('ratio', '9:16'))
+            filename = await make_demo_video(
+                job['id'], job['prompt'], options.get('ratio', '9:16'),
+                duration=options.get('duration', 3), resolution=options.get('resolution', 'auto'),
+            )
         return '/api/media/' + filename
 
     from .jimeng import generate, is_jimeng
@@ -194,16 +215,33 @@ async def invoke_provider(model, job, reference_path, reference_url, set_provide
     check_provider_url(model['api_url'])
     context = build_context(model, job, reference_path, reference_url)
     template = json.loads(model['request_template'])
+    template_tokens = set(TOKENS.findall(model['request_template']))
     for field, label in (('reference_video_base64', '视频'), ('reference_audio_base64', '音频')):
-        if context[field] and field not in TOKENS.findall(model['request_template']):
+        if context[field] and field not in template_tokens:
             raise ValueError(f'当前模型尚未配置{label}参考参数，请配置 {field}')
     payload = apply_template(template, context)
+    if job['kind'] == 'image' and template in (BASE_REQUEST_TEMPLATE, DEFAULT_IMAGE_TEMPLATE):
+        code = model['model_code'].strip().lower()
+        path = urlparse(model['api_url']).path.rstrip('/')
+        if (code == 'gpt-image-2' or code.startswith('gpt-image-2-')) and path.endswith(('/images/generations', '/images/edits')):
+            payload.pop('aspect_ratio', None)
+            if options.get('size'):
+                payload['size'] = context['size']
+            elif context['ratio'] == context['resolution'] == 'auto':
+                payload['size'] = 'auto'
+            else:
+                width, height = gpt_image_2_dimensions(context['width'], context['height'])
+                payload['size'] = f'{width}x{height}'
+        elif template == DEFAULT_IMAGE_TEMPLATE and context['resolution'] in IMAGE_RESOLUTIONS:
+            payload['resolution'] = context['resolution']
+    elif job['kind'] == 'video' and template == DEFAULT_IMAGE_TEMPLATE:
+        payload.update(duration=context['duration'], resolution=context['resolution'])
     headers = auth_headers(model)
     async with httpx.AsyncClient(timeout=httpx.Timeout(100.0, connect=15.0), follow_redirects=False) as client:
         provider_id = job['provider_task_id']
         if not provider_id:
             has_reference = reference_path or reference_url
-            custom_reference = any(token.startswith('reference_') for token in TOKENS.findall(model['request_template']))
+            custom_reference = any(token in template_tokens for token in REFERENCE_TOKENS)
             image_edit = (has_reference and not custom_reference and model['model_code'].startswith('gpt-image')
                           and urlparse(model['api_url']).path.endswith('/images/generations'))
             if image_edit:
@@ -231,7 +269,7 @@ async def invoke_provider(model, job, reference_path, reference_url, set_provide
                                          data={k: str(v) for k, v in payload.items() if v is not None},
                                          files={'image': ('reference.png', buffer.getvalue(), 'image/png')})
             else:
-                if has_reference and not custom_reference:
+                if has_reference and not any(context[token] for token in REFERENCE_TOKENS if token in template_tokens):
                     raise ValueError('当前模型尚未配置参考素材接口，请在模型配置中设置参考素材参数')
                 resp = await client.post(model['api_url'], headers=headers, json=payload)
             resp.raise_for_status()

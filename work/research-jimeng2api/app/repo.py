@@ -505,9 +505,9 @@ def due_tasks(now: int | None = None) -> list[dict]:
     ts = now or db.now()
     rows = db.query(
         "SELECT id, api_key_id, account_id, started_at, upstream_status, progress, "
-        "forecast_credits FROM tasks WHERE status = 'running' AND next_poll_at <= ? "
+        "forecast_credits, extras FROM tasks WHERE status = 'running' AND next_poll_at <= ? "
         "ORDER BY started_at ASC LIMIT 100", (ts,))
-    return [dict(row) for row in rows]
+    return [{**dict(row), "extras": db.loads(row["extras"], {})} for row in rows]
 
 
 def recent_submissions() -> list[dict]:

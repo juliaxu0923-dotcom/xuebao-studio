@@ -55,14 +55,15 @@ def test_public_models_hide_upstream_key():
         assert not str(m.get("id", "")).startswith("dreamina")
 
 
-def test_duration_and_ratio_are_clamped_with_reason():
+def test_duration_is_clamped_with_reason_and_supported_ratio_survives():
     t = service.create_task(
         api_key_id=None, model="视频生成", prompt="猫", size="", count=1,
         duration=99, resolution="1080p", ratio="21:9")
     assert t["mode"] == "video"
     assert t["resolution"] == "1080p"
     assert t["extras"]["video"]["duration_s"] == 15      # 上限
-    assert any("最长 15s" in d for d in t["degradations"])
+    assert t["extras"]["video"]["aspect_ratio"] == "21:9"
+    assert any("99s" in d and d.endswith("15s") for d in t["degradations"])
 
 
 def test_video_requires_prompt():
@@ -218,3 +219,28 @@ def test_submit_wires_frames(monkeypatch):
     assert seen["first_frame"]["image_uri"] == "tos-1"
     assert seen["end_frame"]["image_uri"] == "tos-2"
     assert seen["first_frame"]["width"] == 1024
+
+
+def test_submit_wires_end_frame_without_first_frame(monkeypatch):
+    from app import pool as pool_mod
+
+    inputs = dict(api_key_id=None, model='jimeng-video', prompt='test', size='', count=1,
+                  extras={'reference_mode': 'end_frame'})
+    task = service.create_task(**inputs, images=['tos-end'])
+    seen = {}
+
+    class FakeClient:
+        def submit_video(self, **kwargs):
+            seen.update(kwargs)
+            return 'sid'
+
+    class FakeRuntime:
+        client = FakeClient()
+
+    monkeypatch.setattr(pool_mod.pool, 'runtime', lambda account_id: FakeRuntime())
+    service._submit(1, task, task['image_uris'])
+    assert seen['first_frame'] is None
+    assert seen['end_frame']['image_uri'] == 'tos-end'
+    for refs in ([], ['tos-first', 'tos-end']):
+        with pytest.raises(JimengParamError, match='仅支持一张'):
+            service.create_task(**inputs, images=refs)

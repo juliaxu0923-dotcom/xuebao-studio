@@ -19,9 +19,10 @@ docker compose ps
 docker compose logs --tail=100
 ```
 
-The image installs Linux Node dependencies matching the archived canvas runtime,
-Python dependencies, FFmpeg and Playwright's Chromium headless shell. Runtime
-files are restored and checksum-verified during the build.
+The image uses the same Node executable for the canvas and Playwright. It
+includes the FFmpeg binary supplied by the Python dependency and Playwright's
+Chromium headless shell. The build verifies and extracts the canvas archive in
+a separate stage and copies the extracted runtime into the final image.
 
 The default administrator is `admin`. On a fresh installation, retrieve the
 random initial password privately:
@@ -62,6 +63,20 @@ encryption keys. Back up the complete volume together. Do not upload it to GitHu
 For a consistent filesystem backup, stop this Compose project's container first,
 back up its volume, then start it again. Do not use `docker compose down -v`
 unless you explicitly intend to delete all application data.
+
+Compose scopes this volume to its project name. An update from a renamed checkout
+or a different project name may start with an empty volume. If users or generation
+history disappear after an update, compare the current container's `/data` mount
+with the previous volume before making changes:
+
+```sh
+docker compose ps -q studio
+docker inspect --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}} {{.Source}}{{end}}{{end}}' CONTAINER_ID
+docker volume ls --filter label=com.docker.compose.volume=studio-data
+```
+
+Use the original Compose project name to reuse its volume. The standalone
+`deploy/update-image.sh` script reuses mounts from the existing container.
 
 To update code after backing up data:
 
