@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#f7f7fa">
   <title>雪宝 Studio · AI 创作工作台</title>
   <link rel="stylesheet" href="/static/style.css">
-  <link rel="stylesheet" href="/static/editor.css?v=20261120-duration-menu">
+  <link rel="stylesheet" href="/static/editor.css?v=20261124-jimeng-billing-v1">
 </head>
 <body>
 <div class="app-shell" id="appShell">
@@ -59,7 +59,7 @@
   <label>自定义 Header<input name="auth_header" value="X-API-Key"></label>
   <label class="full">API Key<input name="api_key" type="password" autocomplete="off" placeholder="保存后不回显；编辑时留空表示不修改"></label>
   <label class="full">请求 JSON 模板<textarea name="request_template" rows="4" spellcheck="false">{"model":"{{model}}","prompt":"{{prompt}}","aspect_ratio":"{{ratio}}"}</textarea></label>
-  <label>输出 URL 路径<input name="result_path" value="data.0.url"></label><label>扣费积分<input name="cost" type="number" min="0" value="10"></label>
+  <label>输出 URL 路径<input name="result_path" value="data.0.url"></label><label><span id="modelCostLabel">扣费积分</span><input name="cost" type="number" min="0" value="10"></label>
   <label>任务 ID 路径<input name="task_id_path" value="id"></label><label>状态字段路径<input name="status_path" value="status"></label>
   <label>完成状态（逗号分隔）<input name="completed_status" value="completed,succeeded,success"></label><label>失败状态（逗号分隔）<input name="failed_status" value="failed,error"></label>
   <label class="full check-label"><input name="enabled" type="checkbox" checked> 在用户端启用此模型</label>
@@ -69,6 +69,6 @@
 <input type="file" accept="image/jpeg,image/png,image/webp" id="fileInput" hidden>
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 <script src="/static/jimeng.js?v=20261121-account-concurrency-v1" defer></script>
-<script src="/static/app.js?v=20261123-generation-history-v1" defer></script>
+<script src="/static/app.js?v=20261124-jimeng-billing-v1" defer></script>
 </body>
 </html>

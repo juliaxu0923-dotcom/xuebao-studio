@@ -6,6 +6,7 @@
     POST /async/v1/images/generations    异步：立即返回 task_id
     GET  /async/v1/images/generations/{id}
     GET  /v1/tasks/{id}
+    GET  /v1/tasks/{id}/charge            上游实扣（管理员）
     GET  /v1/models                      免鉴权的能力清单
     GET  /v1/credits                     池子余额（鉴权后可见）
 
@@ -14,17 +15,18 @@
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import Annotated, Any
 from urllib.parse import urlsplit
+from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from . import db, pool as pool_mod, repo, service
 from .config import settings
 from .coordinator import coordinator
-from .security import require_key
+from .security import require_admin, require_key
 from .upstream import postedit, video
 from .upstream.errors import JimengError, JimengParamError
 
@@ -422,7 +424,22 @@ def generate(req: GenerateRequest, key: dict = Depends(require_key)) -> Any:
 
 
 @router.post("/async/v1/images/generations", status_code=202)
-def generate_async(req: GenerateRequest, key: dict = Depends(require_key)) -> Any:
+def generate_async(
+    req: GenerateRequest, key: dict = Depends(require_key),
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+) -> Any:
+    task_id = None
+    if key.get("is_admin") and idempotency_key is not None:
+        try:
+            task_id = str(UUID(idempotency_key))
+        except ValueError as exc:
+            raise HTTPException(400, detail="Idempotency-Key 需为 UUID") from exc
+        existing = repo.get_task_charge(task_id)
+        if existing:
+            if existing["api_key_id"] != key["id"]:
+                raise HTTPException(409, detail="该 Idempotency-Key 已被使用")
+            return JSONResponse(status_code=202, content={"task_id": task_id},
+                                headers=NO_STORE)
     ability = postedit.get(service.resolve_redirect(req.model))
     if ability is not None and ability.shape == "segment":
         raise HTTPException(
@@ -430,9 +447,11 @@ def generate_async(req: GenerateRequest, key: dict = Depends(require_key)) -> An
     if not executor_ready():
         raise HTTPException(503, detail="生成执行器暂不可用，请稍后重试")
     try:
-        task = service.create_task(api_key_id=key["id"], **_payload(req))
+        task = service.create_task(api_key_id=key["id"], task_id=task_id, **_payload(req))
     except JimengParamError as e:
         raise HTTPException(400, detail=str(e)) from e
+    if task_id and task["api_key_id"] != key["id"]:
+        raise HTTPException(409, detail="该 Idempotency-Key 已被使用")
     # 只有 task_id：这是这类上游受理时的原生形状。多塞 status / poll_url /
     # degradations 只是把自己的任务形状漏给客户端（skill §3.1），而客户端
     # 一旦依赖它们，网关就再也改不动内部字段。轮询路径是固定的，不需要告知。
@@ -471,6 +490,15 @@ def task_detail(task_id: str, key: dict = Depends(require_key)) -> dict:
     # error_kind / credits / attempts 是运维字段：业务 Key 拿到的是与轮询端点
     # **同一个协议面**。内部枚举不是客户端的行动依据，露出去他们就会依赖它。
     return task_view(task) if key.get("is_admin") else async_view(task)
+
+
+@router.get("/v1/tasks/{task_id}/charge")
+def task_charge(task_id: str, _key: dict = Depends(require_admin)) -> JSONResponse:
+    task = repo.get_task_charge(task_id)
+    if not task:
+        raise HTTPException(404, detail="task 不存在")
+    result = service.reconcile(task_id, task)
+    return JSONResponse(content={"amount": result.get("amount")}, headers=NO_STORE)
 
 
 def model_entry(spec: Any, *, model_id: str = "", name: str = "",

@@ -39,7 +39,7 @@ function StudioVideoPromptPanel(props) {
 
 function StudioVideoHistory({node, busy, onConfigChange, theme}) {
   const {jsx, jsxs} = e.i(843476);
-  const {useState, useEffect} = e.i(271645);
+  const {useState, useEffect, useRef} = e.i(271645);
   const {Button} = e.i(464571);
   const {Modal} = e.i(212931);
   const {App} = e.i(158962);
@@ -51,6 +51,7 @@ function StudioVideoHistory({node, busy, onConfigChange, theme}) {
   const [loaded, setLoaded] = useState(false);
   const [refresh, setRefresh] = useState(0);
   const [preview, setPreview] = useState(null);
+  const pendingBilling = useRef(new Set());
   const canvasId = location.pathname.split('/').pop();
   const url = `/api/canvas/${encodeURIComponent(canvasId)}/nodes/${encodeURIComponent(node.id)}/videos`;
 
@@ -62,7 +63,13 @@ function StudioVideoHistory({node, busy, onConfigChange, theme}) {
         const response = await fetch(url, {signal: controller.signal});
         const result = await response.json();
         if (!response.ok) throw new Error(result.detail || '生成记录加载失败');
-        if (!controller.signal.aborted) { setItems(result); setError(''); setLoaded(true); }
+        if (!controller.signal.aborted) {
+          if (parent !== window && result.some(item => item.billing_status === 'settled' && pendingBilling.current.has(item.id))) {
+            parent.postMessage({type: 'studio-canvas-credits-changed'}, location.origin);
+          }
+          pendingBilling.current = new Set(result.filter(item => item.billing_status === 'pending').map(item => item.id));
+          setItems(result); setError(''); setLoaded(true);
+        }
       } catch (failure) {
         if (!controller.signal.aborted) setError(failure.message || '生成记录加载失败');
       } finally {
@@ -142,7 +149,11 @@ function StudioVideoHistory({node, busy, onConfigChange, theme}) {
           jsx('div', {className: 'studio-video-history-prompt', title: item.error || item.prompt,
             children: item.status === 'failed' ? item.error || '生成失败' : item.prompt}),
           jsx('div', {className: 'studio-video-history-details', title: item.model_name,
-            children: `${item.options?.resolution || ''} · ${item.options?.duration || ''}s · ${new Date(item.created_at).toLocaleTimeString('zh-CN', {hour: '2-digit', minute: '2-digit'})}`}),
+            children: [
+              `${item.options?.resolution || ''} · ${item.options?.duration || ''}s · ${new Date(item.created_at).toLocaleTimeString('zh-CN', {hour: '2-digit', minute: '2-digit'})}`,
+              item.billing_status === 'pending' ? '积分待即梦确认' : null,
+              item.billing_status === 'settled' ? `即梦实扣 ${item.charged_points} 积分` : null
+            ].filter(Boolean).join(' · ')}),
           jsxs('div', {className: 'studio-video-history-actions', children: [
             jsx(Button, {size: 'small', type: selected(item) ? 'primary' : 'default',
               disabled: pending || item.status !== 'completed' || !item.result_url || selected(item),

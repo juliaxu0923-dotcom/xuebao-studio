@@ -76,7 +76,11 @@ docker volume ls --filter label=com.docker.compose.volume=studio-data
 ```
 
 Use the original Compose project name to reuse its volume. The standalone
-`deploy/update-image.sh` script reuses mounts from the existing container.
+update script reuses mounts from the existing container. On the Docker host,
+run it with `sh deploy/update-image.sh`. After the new container passes its
+health check, the script removes unused, untagged Studio images and keeps
+tagged images and the mounted data volume. If the new container fails to
+start or pass the health check, the previous container is restarted.
 
 To update code after backing up data:
 

@@ -154,7 +154,20 @@ function centerCanvas(){state.panX=120;state.panY=75;state.zoom=1;applyTransform
 function fitCanvas(){if(!state.nodes.length)return centerCanvas();let minX=Math.min(...state.nodes.map(n=>n.x)),minY=Math.min(...state.nodes.map(n=>n.y)),maxX=Math.max(...state.nodes.map(n=>n.x+nodeDims(n).w)),maxY=Math.max(...state.nodes.map(n=>n.y+nodeDims(n).h));const stage=$('stage');const availW=stage.clientWidth-200,availH=stage.clientHeight-300;state.zoom=Math.max(.45,Math.min(1.1,availW/(maxX-minX),availH/(maxY-minY)));state.panX=(stage.clientWidth-(maxX-minX)*state.zoom)/2-minX*state.zoom;state.panY=(stage.clientHeight-(maxY-minY)*state.zoom)/2-minY*state.zoom-55;applyTransform();}
 function setKind(kind){state.kind=kind;renderModels();}
 function renderModels(){const fill=(el,kind)=>{if(!el)return;const current=el.value;const list=state.models.filter(m=>m.kind===kind);el.innerHTML=list.map(m=>`<option value="${m.id}">${esc(m.name)}</option>`).join('')||'<option value="">请先在后台添加模型</option>';el.value=list.some(m=>String(m.id)===current)?current:String(list[0]?.id||'');};fill($('modelSelect'),state.kind);fill($('imageModel'),'image');fill($('videoModel'),'video');refreshVideoDurationPicker();updateVideoResolutions($('videoResolution'),$('videoModel').value);updateCost();}
-function updateCost(){const el=$('modelSelect'),label=$('costLabel');if(!el||!label)return;const m=state.models.find(m=>String(m.id)===el.value);label.textContent=m?`≈ ${m.cost} 积分`:'暂无模型';}
+function modelCostText(model){
+ if(!model)return '暂无模型';
+ if(model.billing_mode!=='jimeng_actual')return `${model.cost} 积分`;
+ return model.cost>0?`按即梦实扣 · 最低余额 ${model.cost} 积分`:'按即梦实扣';
+}
+function updateCost(){
+ for(const [modelId,labelId] of [['modelSelect','costLabel'],['imageModel','imageCost'],['videoModel','videoCost']]){
+  const select=$(modelId),label=$(labelId);
+  if(!select||!label)continue;
+  const model=state.models.find(item=>String(item.id)===select.value);
+  const text=modelCostText(model);
+  label.textContent=model&&model.billing_mode!=='jimeng_actual'?`≈ ${text}`:text;
+ }
+}
 async function upload(){const input=$('fileInput');input.accept=state.uploadTarget==='video'?'image/jpeg,image/png,image/webp,video/mp4,video/webm,audio/mpeg,audio/wav,.mp3,.wav':'image/jpeg,image/png,image/webp';input.value='';input.click();}
 async function onFile(file,target='canvas'){if(!file)return;const form=new FormData();form.append('file',file);try{toast('上传参考图片中…');const r=await api('/uploads',{method:'POST',body:form});if(target==='canvas'){const n=addNode('image',{title:file.name.slice(0,35),src:r.url,assetId:r.id,status:'completed'});setReference(n);}else{pageReferenceWidgets[target].remove();pageReferences[target]={assetId:r.id,url:r.url,name:file.name,mime:file.type};pageReferenceWidgets[target].render();}toast('图片上传成功');}catch(e){toast('上传失败：'+e.message);}}
 async function submitJob({type,prompt,modelId,ratio,resolution,duration,reference=state.pageReference,projectId=null,replaceNode=null,style='',camera='',lens='',count=1,enhance=false}){const model=state.models.find(m=>m.id===+modelId&&m.kind===type);if(!model)throw Error('当前没有对应类型的可用模型，请先在后台配置');let finalPrompt=prompt;if(style)finalPrompt+=`\nStyle: ${style}`;if(camera)finalPrompt+=`\nCamera: ${camera}`;if(lens)finalPrompt+=`\nLens: ${lens}`;if(enhance)finalPrompt+=`\nEnhance and refine the prompt while preserving its subject and intent.`;const job=await api('/jobs',{method:'POST',body:JSON.stringify({project_id:projectId,model_id:+modelId,prompt:finalPrompt,ratio,duration,resolution,reference_asset_id:reference?.assetId||null,reference_job_id:reference?.jobId||null,image_count:count})});if(replaceNode){replaceNode.prompt=finalPrompt;replaceNode.modelId=+modelId;replaceNode.ratio=ratio;replaceNode.resolution=resolution;replaceNode.duration=duration;replaceNode.jobId=job.id;replaceNode.status='running';replaceNode.content='正在生成';replaceNode.src='';}else if(projectId&&state.project?.id===projectId){const n=addNode(type,{title:model.name+' · '+prompt.slice(0,12),prompt:finalPrompt,modelId:+modelId,ratio,resolution,duration,content:'任务提交成功，正在生成…',status:'running',jobId:job.id});if(reference?.jobId||reference?.assetId){const ref=state.nodes.find(x=>x.assetId===reference.assetId||x.jobId===reference.jobId);if(ref&&!state.edges.some(e=>e.source===ref.id&&e.target===n.id))state.edges.push({id:newId(),source:ref.id,target:n.id});}}await saveGraph();if(reference===state.pageReference)state.pageReference=null;refreshUser();if(projectId)watchJob(job.id,replaceNode?.id||state.nodes.at(-1)?.id);return job;}
@@ -210,9 +223,56 @@ async function restorePageJob(job,type){
  prompt.focus();
  toast(missingReference?'已载入生成参数，原参考素材不可用，请重新上传':'已载入生成参数，可修改后重新生成');
 }
+function jobBillingText(job){
+ if(job.billing_status==='pending')return '积分待即梦确认';
+ if(job.billing_status==='settled')return `即梦实扣 ${job.charged_points} 积分`;
+ return '';
+}
+function showJobBilling(host,job,watch=false){
+ const text=jobBillingText(job);
+ if(!text)return;
+ const label=document.createElement('span');
+ label.textContent=text;
+ label.setAttribute('aria-live','polite');
+ host.append(label);
+ host.hidden=false;
+ if(job.billing_status!=='pending')return;
+
+ const button=document.createElement('button');
+ button.type='button';
+ button.className='small-btn';
+ button.textContent='刷新扣费';
+ host.append(' ',button);
+ const refresh=async()=>{
+  if(button.disabled||!host.isConnected)return;
+  button.disabled=true;
+  try{
+   const current=await api('/jobs/'+encodeURIComponent(job.id));
+   if(host.isConnected&&current.billing_status==='settled'){
+    label.textContent=jobBillingText(current);
+    button.remove();
+    await refreshUser();
+   }
+  }finally{button.disabled=false;}
+ };
+ button.onclick=()=>refresh().catch(error=>toast(error.message));
+ if(watch){
+  const delays=[15000,30000,60000];
+  const check=()=>{
+   if(!button.isConnected||!delays.length||document.hidden||!host.getClientRects().length)return;
+   setTimeout(async()=>{
+    if(!button.isConnected||document.hidden||!host.getClientRects().length)return;
+    await refresh().catch(()=>{});
+    check();
+   },delays.shift());
+  };
+  check();
+ }
+}
 function renderPageResult(job,type,older=false){
  const page=historyPages[type];
  if(!page||page.cards.has(job.id)||removedHistoryIds.has(job.id))return;
+ const watchingJob=job.status!=='completed'&&job.status!=='failed';
  const card=document.createElement('div');
  card.className='generation-result';
  card.dataset.jobId=job.id;
@@ -226,7 +286,9 @@ function renderPageResult(job,type,older=false){
     const url=esc(j.result_url);
     const isVideo=type==='video';
     card.innerHTML=(isVideo?`<video src="${url}" controls preload="metadata"></video>`:`<img src="${url}" loading="lazy" alt="生成结果">`)+
-     `<small data-result-details hidden></small><div class="result-actions"><button class="small-btn" data-result-edit="${esc(j.id)}">编辑并重新生成</button><a class="small-btn" href="${url}" download target="_blank" rel="noopener">下载</a></div>`;
+     `<small data-result-details hidden></small><small data-job-billing hidden></small><div class="result-actions"><button class="small-btn" data-result-edit="${esc(j.id)}">编辑并重新生成</button><a class="small-btn" href="${url}" download target="_blank" rel="noopener">下载</a></div>`;
+    showJobBilling(card.querySelector('[data-job-billing]'),j,watchingJob);
+    if(watchingJob&&j.billing_status)refreshUser();
     const media=card.querySelector(isVideo?'video':'img');
     const details=card.querySelector('[data-result-details]');
     const showDetails=()=>{
@@ -248,7 +310,9 @@ function renderPageResult(job,type,older=false){
     return;
    }
    if(j.status==='failed'){
-    card.innerHTML=`<div class="result-error">生成失败：${esc(j.error||'未知错误')}</div><button class="small-btn" data-result-edit="${esc(j.id)}">修改后重试</button>`;
+    card.innerHTML=`<div class="result-error">生成失败：${esc(j.error||'未知错误')}</div><small data-job-billing hidden></small><button class="small-btn" data-result-edit="${esc(j.id)}">修改后重试</button>`;
+    showJobBilling(card.querySelector('[data-job-billing]'),j,watchingJob);
+    if(watchingJob&&j.billing_status)refreshUser();
     card.querySelector('[data-result-edit]').onclick=()=>restorePageJob(j,type);
     return;
    }
@@ -323,6 +387,11 @@ function renderWork(job){
  const media=job.result_url?(job.kind==='video'?`<video src="${url}" controls preload="metadata"></video>`:
   `<img src="${url}" loading="lazy" alt="生成作品">`):'<span>◷ 任务'+(job.status==='failed'?'失败':'执行中')+'</span>';
  card.innerHTML=`<div class="history-media">${media}</div><div class="history-info"><strong>${esc(job.prompt.slice(0,70))}</strong><small>${esc(job.model_name||'模型')} · ${esc(job.created_at.slice(0,16).replace('T',' '))}</small><span class="status-pill ${esc(job.status)}">${job.status==='completed'?'已完成':job.status==='failed'?'失败':'执行中'}</span> ${job.result_url?`<a href="${url}" download target="_blank" rel="noopener">查看 / 下载</a>`:''}${job.error?`<small>${esc(job.error.slice(0,130))}</small>`:''}${['completed','failed'].includes(job.status)?'<button class="small-btn danger-btn" data-delete-job>删除作品</button>':''}</div>`;
+ const status=card.querySelector('.status-pill');
+ const billing=document.createElement('small');
+ billing.hidden=true;
+ status.after(billing);
+ showJobBilling(billing,job);
  const button=card.querySelector('[data-delete-job]');
  if(button)button.onclick=async()=>{
   if(!confirm('从我的作品中删除此作品？画布中的素材会保留。'))return;
@@ -388,7 +457,7 @@ async function renderInvitations(host){
 }
 
 async function renderAdminTable(){const tab=state.adminTab;const host=$('adminTable');$('modelActions').hidden=tab!=='models';if(tab==='jimeng'){await renderJimeng(host);return;}if(tab==='messages'){await renderJimeng.renderMessages(host);return;}if(tab==='invitations'){await renderInvitations(host);return;}if(tab==='models'){
- state.adminModels=await api('/admin/models');host.innerHTML=state.adminModels.length?`<table class="data-table"><thead><tr><th>名称 / 模型</th><th>类型</th><th>协议</th><th>扣费</th><th>状态</th><th>操作</th></tr></thead><tbody>${state.adminModels.map(m=>`<tr><td><strong>${esc(m.name)}</strong><br><code>${esc(m.model_code)}</code></td><td>${m.kind==='image'?'图片':'视频'}</td><td>${esc(m.protocol)}</td><td>${m.cost} 积分</td><td><span class="status-pill ${m.enabled?'completed':'failed'}">${m.enabled?'启用':'停用'}</span></td><td><button class="small-btn" data-edit-model="${m.id}">配置接口</button> <button class="small-btn" data-toggle-model="${m.id}" data-enabled="${m.enabled?'0':'1'}">${m.enabled?'停用':'启用'}</button> <button class="small-btn danger-btn" data-delete-model="${m.id}" data-delete-model-name="${esc(m.name)}">删除模型</button></td></tr>`).join('')}</tbody></table>`:'<div class="empty-note">尚未配置模型</div>';
+ state.adminModels=await api('/admin/models');host.innerHTML=state.adminModels.length?`<table class="data-table"><thead><tr><th>名称 / 模型</th><th>类型</th><th>协议</th><th>扣费</th><th>状态</th><th>操作</th></tr></thead><tbody>${state.adminModels.map(m=>`<tr><td><strong>${esc(m.name)}</strong><br><code>${esc(m.model_code)}</code></td><td>${m.kind==='image'?'图片':'视频'}</td><td>${esc(m.protocol)}</td><td>${esc(modelCostText(m))}</td><td><span class="status-pill ${m.enabled?'completed':'failed'}">${m.enabled?'启用':'停用'}</span></td><td><button class="small-btn" data-edit-model="${m.id}">配置接口</button> <button class="small-btn" data-toggle-model="${m.id}" data-enabled="${m.enabled?'0':'1'}">${m.enabled?'停用':'启用'}</button> <button class="small-btn danger-btn" data-delete-model="${m.id}" data-delete-model-name="${esc(m.name)}">删除模型</button></td></tr>`).join('')}</tbody></table>`:'<div class="empty-note">尚未配置模型</div>';
  host.querySelectorAll('[data-edit-model]').forEach(btn=>btn.onclick=()=>openModel(state.adminModels.find(m=>m.id===+btn.dataset.editModel)));
  host.querySelectorAll('[data-toggle-model]').forEach(btn=>btn.onclick=()=>toggleModel(btn));
  host.querySelectorAll('[data-delete-model]').forEach(btn=>btn.onclick=()=>deleteModel(+btn.dataset.deleteModel,btn.dataset.deleteModelName));
@@ -399,7 +468,9 @@ async function renderAdminTable(){const tab=state.adminTab;const host=$('adminTa
  host.querySelectorAll('[data-password-id]').forEach(btn=>btn.onclick=()=>changeUserPassword(+btn.dataset.passwordId,btn.dataset.passwordName));
  host.querySelectorAll('[data-delete-user]').forEach(btn=>btn.onclick=()=>deleteUser(+btn.dataset.deleteUser,btn.dataset.deleteName));
  }else{
- const rows=await api('/admin/jobs');host.innerHTML=`<table class="data-table"><thead><tr><th>任务</th><th>用户</th><th>模型</th><th>状态</th><th>扣费</th><th>时间</th></tr></thead><tbody>${rows.map(j=>`<tr><td><code>${esc(j.id.slice(0,10))}</code></td><td>${esc(j.username)}</td><td>${esc(j.model_name)}</td><td><span class="status-pill ${esc(j.status)}">${esc(j.status)}</span>${j.error?'<br><small title="'+esc(j.error)+'">'+esc(j.error.slice(0,40))+'</small>':''}</td><td>${j.charged_points}</td><td>${esc(j.created_at.slice(0,16).replace('T',' '))}</td></tr>`).join('')}</tbody></table>`;
+ const rows=await api('/admin/jobs');
+ if(state.adminTab!==tab)return;
+ host.innerHTML=`<table class="data-table"><thead><tr><th>任务</th><th>用户</th><th>模型</th><th>状态</th><th>扣费</th><th>时间</th></tr></thead><tbody>${rows.map(j=>`<tr><td><code>${esc(j.id.slice(0,10))}</code></td><td>${esc(j.username)}</td><td>${esc(j.model_name)}</td><td><span class="status-pill ${esc(j.status)}">${esc(j.status)}</span>${j.error?'<br><small title="'+esc(j.error)+'">'+esc(j.error.slice(0,40))+'</small>':''}</td><td>${esc(jobBillingText(j)||j.charged_points)}</td><td>${esc(j.created_at.slice(0,16).replace('T',' '))}</td></tr>`).join('')}</tbody></table>`;
  }}
 async function changeCredits(userId,name){const value=prompt(`请输入要为 ${name} 增加的积分（负数表示扣除）：`,'100');if(value===null)return;const amount=Number(value);if(!Number.isInteger(amount)||Math.abs(amount)>1000000){toast('请输入有效整数');return;}try{await api(`/admin/users/${userId}/credits`,{method:'POST',body:JSON.stringify({amount})});toast('积分调整成功');await renderAdminTable();refreshUser();}catch(e){toast(e.message);}}
 async function toggleModel(button){
@@ -418,7 +489,7 @@ async function deleteModel(id,name){if(!confirm(`确定删除模型“${name}”
 async function createUser(){const username=prompt('输入新用户名（英文、数字、下划线或短横线）：');if(username===null)return;const password=prompt('输入初始密码（至少 8 位）：');if(password===null)return;const points=prompt('初始积分：','100');if(points===null)return;try{await api('/admin/users',{method:'POST',body:JSON.stringify({username,password,points:Number(points)})});toast('用户创建成功');await renderAdminTable();}catch(e){toast(e.message);}}
 async function changeUserPassword(id,name){const password=prompt(`请输入 ${name} 的新密码（至少 8 位）：`);if(password===null)return;try{await api(`/admin/users/${id}/password`,{method:'PUT',body:JSON.stringify({password})});toast('密码修改成功');}catch(e){toast(e.message);}}
 async function deleteUser(id,name){if(!confirm(`确定删除用户 ${name} 及其项目、任务和素材记录吗？`))return;try{await api(`/admin/users/${id}`,{method:'DELETE'});toast('用户已删除');await renderAdminTable();}catch(e){toast(e.message);}}
-function openModel(model=null){$('modelOverlay').hidden=false;const form=$('modelForm');form.reset();form.dataset.editId=model?.id||'';$('modelModalTitle').textContent=model?'编辑模型接口':'创建模型接口';$('modelError').textContent='';const vals=model||{protocol:'sync_json',kind:'image',auth_mode:'bearer',auth_header:'X-API-Key',request_template:'{"model":"{{model}}","prompt":"{{prompt}}","aspect_ratio":"{{ratio}}"}',result_path:'data.0.url',task_id_path:'id',status_path:'status',completed_status:'completed,succeeded,success',failed_status:'failed,error',cost:10,enabled:true};for(const [key,value] of Object.entries(vals)){const inp=form.elements.namedItem(key);if(!inp||key==='api_key')continue;if(inp.type==='checkbox')inp.checked=!!value;else inp.value=value??'';}}
+function openModel(model=null){$('modelOverlay').hidden=false;const form=$('modelForm');form.reset();form.dataset.editId=model?.id||'';$('modelModalTitle').textContent=model?'编辑模型接口':'创建模型接口';$('modelError').textContent='';$('modelCostLabel').textContent=model?.billing_mode==='jimeng_actual'?'最低余额要求（积分）':'扣费积分';const vals=model||{protocol:'sync_json',kind:'image',auth_mode:'bearer',auth_header:'X-API-Key',request_template:'{"model":"{{model}}","prompt":"{{prompt}}","aspect_ratio":"{{ratio}}"}',result_path:'data.0.url',task_id_path:'id',status_path:'status',completed_status:'completed,succeeded,success',failed_status:'failed,error',cost:10,enabled:true};for(const [key,value] of Object.entries(vals)){const inp=form.elements.namedItem(key);if(!inp||key==='api_key')continue;if(inp.type==='checkbox')inp.checked=!!value;else inp.value=value??'';}}
 async function submitModel(event){event.preventDefault();const form=$('modelForm');const out={};new FormData(form).forEach((value,key)=>out[key]=value);out.cost=+out.cost;out.enabled=form.elements.enabled.checked;out.api_key=out.api_key||'';try{const id=form.dataset.editId;await api(id?`/admin/models/${id}`:'/admin/models',{method:id?'PUT':'POST',body:JSON.stringify(out)});$('modelOverlay').hidden=true;toast('模型配置已保存');state.models=await api('/models');renderModels();loadAdmin();}catch(e){$('modelError').textContent=e.message;}}
 async function authenticate(event){event.preventDefault();const username=$('loginName').value.trim(),password=$('loginPassword').value;try{await api('/auth/'+(state.loginMode==='login'?'login':'register'),{method:'POST',body:JSON.stringify({username,password,...(state.loginMode==='register'?{invitation_code:$('invitationCode').value.trim()}: {})})});$('authError').textContent='';$('loginOverlay').hidden=true;await bootstrap();toast('欢迎进入雪宝 Studio');}catch(e){$('authError').textContent=e.message;}}
 async function bootstrap(){setUser(await api('/me'));state.models=await api('/models');renderModels();await loadWorkspace();}
@@ -457,7 +528,14 @@ function mountDurationPicker(input,modelSelect){
 function wireEvents(){
  refreshVideoDurationPicker=mountDurationPicker($('videoDuration'),$('videoModel'));
  $('videoModel').addEventListener('change',()=>updateVideoResolutions($('videoResolution'),$('videoModel').value));
- let canvasRefreshTimer;window.addEventListener('message',event=>{if(event.origin!==location.origin||event.source!==$('infiniteCanvasFrame')?.contentWindow||event.data?.type!=='studio-canvas-changed')return;clearTimeout(canvasRefreshTimer);canvasRefreshTimer=setTimeout(async()=>{try{state.projects=await api('/projects');renderProjects();await refreshUser();}catch(e){toast(e.message);}},500);});
+ let canvasRefreshTimer;
+ window.addEventListener('message',event=>{
+  if(event.origin!==location.origin||event.source!==$('infiniteCanvasFrame')?.contentWindow)return;
+  if(event.data?.type==='studio-canvas-credits-changed')refreshUser();
+  if(event.data?.type!=='studio-canvas-changed')return;
+  clearTimeout(canvasRefreshTimer);
+  canvasRefreshTimer=setTimeout(async()=>{try{state.projects=await api('/projects');renderProjects();await refreshUser();}catch(e){toast(e.message);}},500);
+ });
 
  for(const type of ['image','video'])pageReferenceWidgets[type]=mountReference($(type+'Prompt'),$(type+'RefName').parentElement,()=>pageReferences[type],ref=>{pageReferences[type]=ref;},()=>$(type+'RefName').textContent=pageReferences[type]?.name||'');
 document.querySelectorAll('[data-view]').forEach(btn=>btn.addEventListener('click',()=>setView(btn.dataset.view)));document.querySelectorAll('[data-add]').forEach(btn=>btn.addEventListener('click',()=>addNode(btn.dataset.add)));document.querySelectorAll('[data-kind]').forEach(btn=>btn.addEventListener('click',()=>setKind(btn.dataset.kind)));
@@ -466,7 +544,7 @@ document.querySelectorAll('[data-view]').forEach(btn=>btn.addEventListener('clic
  $('uploadShortcut').onclick=()=>{if(state.activeView==='canvas'&&$('infiniteCanvasFrame')){$('infiniteCanvasFrame').contentWindow.postMessage({type:'studio-canvas-upload'},location.origin);return;}state.uploadTarget=state.activeView==='canvas'?'canvas':state.activeView==='video'?'video':'image';if(state.uploadTarget==='image')setView('image');upload();};
  $('nodeUploadBtn').onclick=()=>{state.uploadTarget='canvas';upload();};
  $('fileInput').addEventListener('change',e=>onFile(e.target.files[0],state.uploadTarget||'canvas'));
- $('imageModel').onchange=()=>{$('imageCost').textContent='≈ '+(state.models.find(m=>m.id===+$('imageModel').value)?.cost||0)+' 积分';};$('videoModel').onchange=()=>{$('videoCost').textContent='≈ '+(state.models.find(m=>m.id===+$('videoModel').value)?.cost||0)+' 积分';refreshVideoDurationPicker();};$('imageGenerate').onclick=$('videoGenerate').onclick=generate;$('centerCanvasBtn').onclick=centerCanvas;$('fitCanvasBtn').onclick=fitCanvas;
+ $('imageModel').onchange=updateCost;$('videoModel').onchange=()=>{updateCost();refreshVideoDurationPicker();};$('imageGenerate').onclick=$('videoGenerate').onclick=generate;$('centerCanvasBtn').onclick=centerCanvas;$('fitCanvasBtn').onclick=fitCanvas;
  $('imageReference').onclick=()=>{state.uploadTarget='image';upload();};$('videoReference').onclick=()=>{state.uploadTarget='video';upload();};
  $('zoomOutBtn').onclick=()=>{state.zoom=Math.max(.4,Math.round((state.zoom-.1)*10)/10);applyTransform();};$('zoomInBtn').onclick=()=>{state.zoom=Math.min(1.8,Math.round((state.zoom+.1)*10)/10);applyTransform();};
  $('stage').addEventListener('pointerdown',evt=>{if(evt.target.closest('.node,.composer,.canvas-toolbar,.canvas-tools,.canvas-zoom,.canvas-topright'))return;state.drag={kind:'pan',startX:evt.clientX,startY:evt.clientY,panX:state.panX,panY:state.panY};$('stage').setPointerCapture(evt.pointerId);});

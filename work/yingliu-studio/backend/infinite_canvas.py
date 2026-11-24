@@ -238,7 +238,9 @@ def register(app, api):
 
     @app.get('/api/settings')
     def settings(user=Depends(whoami)):
-        models = rows('SELECT id,name,kind,model_code,cost FROM models WHERE enabled=1 AND deleted=0')
+        from .jimeng import is_jimeng
+
+        models = rows('SELECT id,name,kind,model_code,cost,protocol,api_url FROM models WHERE enabled=1 AND deleted=0')
         image = [m['model_code'] for m in models if m['kind'] == 'image']
         video = [m['model_code'] for m in models if m['kind'] == 'video']
         channels = []
@@ -247,7 +249,8 @@ def register(app, api):
                              'models': [m['model_code']], 'modelCapabilities': {m['model_code']: m['kind']},
                              'weight': 1, 'timeout': 300, 'enabled': True, 'remark': '', 'workflows': []})
         return envelope({'modelChannel': {'availableModels': image + video, 'availableWorkflows': [],
-                         'modelCosts': [{'model': m['model_code'], 'credits': m['cost']} for m in models],
+                         'modelCosts': [{'model': m['model_code'], 'credits': m['cost']}
+                                        for m in models if not is_jimeng(m)],
                          'channels': channels, 'defaultModel': next(iter(image), ''), 'defaultImageModel': next(iter(image), ''),
                          'defaultVideoModel': next(iter(video), ''), 'defaultTextModel': '', 'systemPrompt': '',
                          'systemPrompts': {'image': '', 'video': '', 'text': '', 'workflow': '', 'workflowAgent': ''},
@@ -342,6 +345,7 @@ def register(app, api):
         return {'id': job['id'], 'status': job['status'], 'progress': 100 if job['status'] == 'completed' else 0,
                 'model': model['model_code'], 'prompt': job['prompt'], 'source': 'canvas',
                 'source_id': str(job['project_id'] or ''), 'created_at': job['created_at'],
+                'billing_status': job['billing_status'], 'charged_points': job['charged_points'],
                 'image_url' if kind == 'image' else 'video_url': job.get('result_url') or '',
                 'url': job.get('result_url') or '', 'error': {'message': job.get('error') or ''}}
 
@@ -458,7 +462,7 @@ def register(app, api):
         content_type = result.headers.get('content-type', 'text/html')
         # Next assets use immutable caching. A patched bundle needs a new URL,
         # including references inside the server-rendered hydration payload.
-        content = content.replace(b'0iqtaf0ai17gn.js', b'0iqtaf0ai17gn-studio-copy-v3.js')
+        content = content.replace(b'0iqtaf0ai17gn.js', b'0iqtaf0ai17gn-studio-copy-v4.js')
         content = content.replace(b'1_tj89_8ipyt2.js', b'1_tj89_8ipyt2-studio-image-sizes-v1.js')
         content = content.replace(b'20g6bk7ya_8li.js', b'20g6bk7ya_8li-studio-model-names-v1.js')
         for name in ASSET_PICKER_CHUNKS:
@@ -555,6 +559,7 @@ def register(app, api):
         @app.get('/_next/static/chunks/0iqtaf0ai17gn-studio-copy-v1.js')
         @app.get('/_next/static/chunks/0iqtaf0ai17gn-studio-copy-v2.js')
         @app.get('/_next/static/chunks/0iqtaf0ai17gn-studio-copy-v3.js')
+        @app.get('/_next/static/chunks/0iqtaf0ai17gn-studio-copy-v4.js')
         @app.get('/_next/static/chunks/0iqtaf0ai17gn-studio-ref-v2.js')
         def studio_reference_picker():
             source = (RUNTIME / '.next/static/chunks/0iqtaf0ai17gn.js').read_text(encoding='utf-8')

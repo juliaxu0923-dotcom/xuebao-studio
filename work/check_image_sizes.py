@@ -54,6 +54,20 @@ def submit_canvas(client, fields, multipart):
     return client.post('/api/v1/canvas/image-tasks', json={'request': fields})
 
 
+def assert_provider_payload(model, job, expected):
+    result_url = 'https://example.test/result.png'
+
+    def respond(request):
+        assert str(request.url) == model['api_url']
+        assert json.loads(request.content) == expected, request.content
+        return httpx.Response(200, json={'data': [{'url': result_url}]})
+
+    mock_client = partial(httpx.AsyncClient, transport=httpx.MockTransport(respond))
+    with patch.object(adapters, 'check_provider_url'), patch.object(adapters.httpx, 'AsyncClient', mock_client):
+        result = asyncio.run(adapters.invoke_provider(model, job, None, None, lambda _: None))
+    assert result == result_url
+
+
 def check_provider_request(job_id):
     job = main.one('SELECT * FROM jobs WHERE id=?', (job_id,))
     model = {
@@ -66,20 +80,36 @@ def check_provider_request(job_id):
             'resolution': '{{resolution}}',
         }),
     }
-    result_url = 'https://example.test/result.png'
+    assert_provider_payload(model, job, {
+        'model': 'example-image', 'prompt': job['prompt'], 'aspect_ratio': '16:9',
+        'size': '3840x2160', 'width': 3840, 'height': 2160, 'resolution': '4K',
+    })
 
-    def respond(request):
-        assert str(request.url) == model['api_url']
-        assert json.loads(request.content) == {
-            'model': 'example-image', 'prompt': job['prompt'], 'aspect_ratio': '16:9',
-            'size': '3840x2160', 'width': 3840, 'height': 2160, 'resolution': '4K',
-        }
-        return httpx.Response(200, json={'data': [{'url': result_url}]})
 
-    mock_client = partial(httpx.AsyncClient, transport=httpx.MockTransport(respond))
-    with patch.object(adapters, 'check_provider_url'), patch.object(adapters.httpx, 'AsyncClient', mock_client):
-        result = asyncio.run(adapters.invoke_provider(model, job, None, None, lambda _: None))
-    assert result == result_url
+def check_gpt_image_2_requests():
+    model = {
+        'kind': 'image', 'protocol': 'sync_json', 'model_code': 'gpt-image-2',
+        'api_url': 'https://example.test/v1/images/generations',
+        'auth_mode': 'none', 'encrypted_key': '', 'result_path': 'data.0.url',
+    }
+    job = {'kind': 'image', 'prompt': 'size check', 'provider_task_id': ''}
+    template = {'model': '{{ model }}', 'prompt': '{{ prompt }}', 'quality': 'low'}
+    expected = {'model': 'gpt-image-2', 'prompt': job['prompt'], 'quality': 'low'}
+    for fields, options, sizes in (
+        ({}, {}, {'size': '1280x720'}),
+        ({'aspect_ratio': '{{ ratio }}'}, {}, {'size': '1280x720'}),
+        ({'size': '{{size}}'}, {}, {'size': '1280x720'}),
+        ({'size': '{{size}}'}, {'size': '1536x864'}, {'size': '1536x864'}),
+        ({'size': '{{size}}'}, {'ratio': 'auto', 'resolution': 'auto'}, {'size': 'auto'}),
+        ({'size': '1024x1024'}, {}, {'size': '1024x1024'}),
+        ({'parameters': {'width': '{{width}}', 'height': '{{height}}'}}, {},
+         {'parameters': {'width': 1280, 'height': 720}}),
+        ({'aspect_ratio': '{{ratio}}', 'resolution': '{{resolution}}'}, {},
+         {'aspect_ratio': '16:9', 'resolution': '1K'}),
+    ):
+        model['request_template'] = json.dumps({**template, **fields})
+        job['options_json'] = json.dumps({'ratio': '16:9', 'resolution': '1K', **options})
+        assert_provider_payload(model, job, {**expected, **sizes})
 
 
 with tempfile.TemporaryDirectory(prefix='xuebao-image-sizes-') as folder:
@@ -125,6 +155,8 @@ with tempfile.TemporaryDirectory(prefix='xuebao-image-sizes-') as folder:
             for invalid_size in ('0x1024', '1024xbad', '8192x8192'):
                 response = submit_canvas(client, {'size': invalid_size}, multipart)
                 assert response.status_code == 400, response.text
+
+    check_gpt_image_2_requests()
 
 print('Image sizes passed for the standalone page, canvas JSON and multipart submissions, '
       'canvas result sync, and provider templates.')

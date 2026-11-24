@@ -23,6 +23,7 @@ MEDIA.mkdir(parents=True, exist_ok=True)
 TOKENS = re.compile(r'\{\{\s*([\w.]+)\s*\}\}')
 BASE_REQUEST_TEMPLATE = {'model': '{{model}}', 'prompt': '{{prompt}}'}
 DEFAULT_IMAGE_TEMPLATE = {**BASE_REQUEST_TEMPLATE, 'aspect_ratio': '{{ratio}}'}
+IMAGE_SIZE_FIELDS = {'size', 'width', 'height', 'image_size', 'imageSize', 'resolution', 'ratio', 'aspectRatio'}
 REFERENCE_TOKENS = ('reference_image', 'reference_base64', 'reference_video_base64', 'reference_audio_base64')
 VIDEO_HEIGHTS = {'480p': 480, '720p': 720, '1080p': 1080}
 
@@ -92,6 +93,13 @@ def auth_headers(model):
     return headers
 
 
+def uses_gpt_image_2_sizes(model):
+    code = model['model_code'].strip().lower()
+    path = urlparse(model.get('api_url', '')).path.rstrip('/')
+    return (code == 'gpt-image-2' or code.startswith('gpt-image-2-')) and path.endswith(
+        ('/images/generations', '/images/edits'))
+
+
 def build_context(model, job, reference_path=None, reference_url=None):
     options = json.loads(job['options_json'])
     ratio = options.get('ratio', '9:16')
@@ -105,8 +113,13 @@ def build_context(model, job, reference_path=None, reference_url=None):
         'reference_image': reference_url or '', 'reference_base64': '', 'reference_video_base64': '', 'reference_audio_base64': '',
     }
     if is_image:
-        width, height = image_dimensions(ratio, context['resolution'], options.get('size'))
-        context.update(size=f'{width}x{height}', width=width, height=height)
+        explicit_size = options.get('size')
+        width, height = image_dimensions(ratio, context['resolution'], explicit_size)
+        gpt_size = not explicit_size and uses_gpt_image_2_sizes(model)
+        if gpt_size:
+            width, height = gpt_image_2_dimensions(width, height)
+        size = 'auto' if gpt_size and ratio == context['resolution'] == 'auto' else f'{width}x{height}'
+        context.update(size=size, width=width, height=height)
     if reference_path:
         p = Path(reference_path)
         if p.exists():
@@ -220,20 +233,16 @@ async def invoke_provider(model, job, reference_path, reference_url, set_provide
         if context[field] and field not in template_tokens:
             raise ValueError(f'当前模型尚未配置{label}参考参数，请配置 {field}')
     payload = apply_template(template, context)
-    if job['kind'] == 'image' and template in (BASE_REQUEST_TEMPLATE, DEFAULT_IMAGE_TEMPLATE):
-        code = model['model_code'].strip().lower()
-        path = urlparse(model['api_url']).path.rstrip('/')
-        if (code == 'gpt-image-2' or code.startswith('gpt-image-2-')) and path.endswith(('/images/generations', '/images/edits')):
+    if job['kind'] == 'image' and uses_gpt_image_2_sizes(model):
+        ratio_template = template.get('aspect_ratio')
+        ratio_token = TOKENS.fullmatch(ratio_template) if isinstance(ratio_template, str) else None
+        has_custom_ratio = 'aspect_ratio' in payload and (not ratio_token or ratio_token[1] != 'ratio')
+        if (not has_custom_ratio and IMAGE_SIZE_FIELDS.isdisjoint(payload)
+                and template_tokens.isdisjoint(('size', 'width', 'height', 'resolution'))):
             payload.pop('aspect_ratio', None)
-            if options.get('size'):
-                payload['size'] = context['size']
-            elif context['ratio'] == context['resolution'] == 'auto':
-                payload['size'] = 'auto'
-            else:
-                width, height = gpt_image_2_dimensions(context['width'], context['height'])
-                payload['size'] = f'{width}x{height}'
-        elif template == DEFAULT_IMAGE_TEMPLATE and context['resolution'] in IMAGE_RESOLUTIONS:
-            payload['resolution'] = context['resolution']
+            payload['size'] = context['size']
+    elif job['kind'] == 'image' and template == DEFAULT_IMAGE_TEMPLATE and context['resolution'] in IMAGE_RESOLUTIONS:
+        payload['resolution'] = context['resolution']
     elif job['kind'] == 'video' and template == DEFAULT_IMAGE_TEMPLATE:
         payload.update(duration=context['duration'], resolution=context['resolution'])
     headers = auth_headers(model)

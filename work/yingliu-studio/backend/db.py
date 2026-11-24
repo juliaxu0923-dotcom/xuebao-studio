@@ -125,8 +125,19 @@ def setup_db():
         columns = {row['name'] for row in c.execute('PRAGMA table_info(models)').fetchall()}
         if 'deleted' not in columns:
             c.execute('ALTER TABLE models ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0')
-        if 'deleted' not in {r['name'] for r in c.execute('PRAGMA table_info(jobs)')}:
-            c.execute('ALTER TABLE jobs ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0')
+        if 'points_due' not in {r['name'] for r in c.execute('PRAGMA table_info(users)')}:
+            c.execute('ALTER TABLE users ADD COLUMN points_due INTEGER NOT NULL DEFAULT 0')
+        job_columns = {r['name'] for r in c.execute('PRAGMA table_info(jobs)')}
+        for name, declaration in (
+            ('deleted', 'INTEGER NOT NULL DEFAULT 0'),
+            ('billing_status', "TEXT NOT NULL DEFAULT ''"),
+            ('reserved_points', 'INTEGER NOT NULL DEFAULT 0'),
+            ('billing_check_at', 'INTEGER NOT NULL DEFAULT 0'),
+        ):
+            if name not in job_columns:
+                c.execute(f'ALTER TABLE jobs ADD COLUMN {name} {declaration}')
+        c.execute("""CREATE INDEX IF NOT EXISTS idx_jobs_billing_check ON jobs(billing_check_at)
+                     WHERE billing_status='pending' AND status IN ('completed', 'failed')""")
         count = c.execute('SELECT COUNT(*) AS n FROM models').fetchone()['n']
         if count == 0:
             for kind, name, code, cost in (

@@ -27,6 +27,8 @@
 .history-info{position:relative;background:#fff;flex:0 0 auto;min-width:0;z-index:1}
 .history-info small{overflow-wrap:anywhere}
 .history-info [data-delete-job]{display:block;margin-top:10px}
+.generation-result [data-job-billing]{display:block;margin:6px 0;color:#615b70}
+.generation-result [data-job-billing] button{margin:3px 0}
 .duration-picker{position:relative;min-width:0}.duration-picker input{padding-right:36px!important;appearance:textfield}.duration-picker input::-webkit-inner-spin-button,.duration-picker input::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}.duration-toggle{position:absolute;right:1px;top:1px;bottom:1px;width:34px;border:0;background:transparent;color:#555;cursor:pointer}.duration-menu{position:absolute;top:calc(100% + 4px);left:0;right:0;max-height:132px;overflow-y:auto;overscroll-behavior:contain;z-index:15;border:1px solid #dedbe7;border-radius:6px;background:#fff;box-shadow:0 4px 12px #0002;padding:4px}.duration-menu[hidden]{display:none}.duration-menu button{display:block;min-height:36px;width:100%;padding:8px 10px;text-align:left;border:0;border-radius:4px;background:white;color:#40394e;cursor:pointer}.duration-menu button:hover,.duration-menu button:focus,.duration-menu button[aria-selected=true]{background:#efedf8;outline:none}
 #invitationLabel[hidden]{display:none}#inviteForm{gap:12px;align-items:center;flex-wrap:wrap}#newInvitationCodes{padding:0 12px}#newInvitationCodes:empty{display:none}
 .generation-actions .reference-card{flex-wrap:wrap}.generation-actions .reference-card>span{flex:1;min-width:80px;max-width:320px}.generation-actions .reference-card button{padding:0 10px}.generation-actions .reference-card .reference-thumb{padding:0}

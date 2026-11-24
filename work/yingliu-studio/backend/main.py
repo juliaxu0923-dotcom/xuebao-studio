@@ -63,7 +63,7 @@ def whoami(request: Request):
     token = request.cookies.get(COOKIE_NAME, '')
     if not token:
         raise HTTPException(status_code=401, detail='请先登录')
-    row = one('''SELECT u.id,u.username,u.role,u.points FROM sessions s
+    row = one('''SELECT u.id,u.username,u.role,u.points-u.points_due AS points FROM sessions s
                  JOIN users u ON u.id=s.user_id
                  WHERE s.token_hash=? AND s.expires_at>?''',
               (hashlib.sha256(token.encode()).hexdigest(), now()))
@@ -86,16 +86,36 @@ def assert_owner(table, obj_id, user_id):
 
 
 def public_model(m):
+    from .jimeng import is_jimeng
+
     m = dict(m)
     m['has_api_key'] = bool(m.pop('encrypted_key', ''))
     m.pop('auth_header', None) if m['protocol'] == 'demo' else None
+    if is_jimeng(m):
+        m['billing_mode'] = 'jimeng_actual'
     return m
 
 
 def present_job(j):
     result = dict(j)
     result['options'] = json.loads(result.pop('options_json'))
+    result.pop('billing_check_at')
+    result.pop('reserved_points')
     return result
+
+
+def can_spend_points(c, user_id, amount):
+    return c.execute('''SELECT 1 FROM users u WHERE u.id=? AND u.points-u.points_due-(
+                        SELECT COALESCE(SUM(reserved_points), 0) FROM jobs
+                        WHERE user_id=u.id AND billing_status='pending' AND status IN ('queued','running')
+                        )>=?''', (user_id, amount)).fetchone() is not None
+
+
+def adjust_points(c, user_id, delta):
+    # Keep the original nonnegative wallet column and carry any shortfall into top-ups.
+    return c.execute('''UPDATE users SET points=MAX(points-points_due+?, 0),
+                        points_due=MAX(points_due-points-?, 0) WHERE id=?''',
+                     (delta, delta, user_id)).rowcount
 
 
 def launch_job(job_id):
@@ -200,14 +220,19 @@ async def execute_job(job_id):
     with db() as c:
         c.execute("UPDATE jobs SET status='running', updated_at=? WHERE id=?", (now(), job_id))
     try:
-        reference_path = reference_url = None
-        if not job['provider_task_id']:
-            reference_path, reference_url = await run_in_threadpool(prepare_job_references, model, job)
-
         def set_provider_id(provider_id):
             with db() as c:
                 c.execute('UPDATE jobs SET provider_task_id=?, updated_at=? WHERE id=?',
                           (provider_id, now(), job_id))
+
+        if job['billing_status'] == 'pending':
+            from .jimeng import is_jimeng, resume_submission
+            if not is_jimeng(model):
+                raise ValueError('即梦模型配置已变更，无法继续生成')
+            await resume_submission(job)
+        reference_path = reference_url = None
+        if not job['provider_task_id']:
+            reference_path, reference_url = await run_in_threadpool(prepare_job_references, model, job)
 
         url = await invoke_provider(model, job, reference_path, reference_url, set_provider_id)
         url = await preserve_generated_media(job_id, job['kind'], url)
@@ -222,17 +247,67 @@ def fail_job(job_id, error):
     """Charge refunds are idempotent within one SQLite transaction."""
     with db() as c:
         c.execute('BEGIN IMMEDIATE')
-        j = c.execute('SELECT user_id, charged_points, refunded, status FROM jobs WHERE id=?',
+        j = c.execute('''SELECT user_id,charged_points,refunded,status,billing_status,provider_task_id
+                         FROM jobs WHERE id=?''',
                       (job_id,)).fetchone()
         if not j or j['status'] in ('completed', 'failed'):
             c.execute('COMMIT')
             return
-        if not j['refunded'] and j['charged_points']:
-            c.execute('UPDATE users SET points=points+? WHERE id=?',
-                      (j['charged_points'], j['user_id']))
-        c.execute("UPDATE jobs SET status='failed',error=?,refunded=1,updated_at=? WHERE id=?",
-                  (error, now(), job_id))
+        billing_status = j['billing_status']
+        refunded = j['refunded']
+        if not billing_status:
+            if not refunded and j['charged_points']:
+                adjust_points(c, j['user_id'], j['charged_points'])
+            refunded = 1
+        elif not j['provider_task_id']:
+            billing_status = 'settled'  # The request never reached Jimeng.
+        c.execute("""UPDATE jobs SET status='failed',error=?,refunded=?,billing_status=?,updated_at=?
+                     WHERE id=?""", (error, refunded, billing_status, now(), job_id))
         c.execute('COMMIT')
+
+
+def settle_jimeng_charge(job_id, amount):
+    with db() as c:
+        c.execute('BEGIN IMMEDIATE')
+        job = c.execute("""UPDATE jobs SET billing_status='settled',charged_points=?,billing_check_at=0
+                           WHERE id=? AND billing_status='pending' AND status IN ('completed','failed')
+                           RETURNING user_id""", (amount, job_id)).fetchone()
+        if job:
+            adjust_points(c, job['user_id'], -amount)
+        c.execute('COMMIT')
+
+
+async def reconcile_jimeng_charges():
+    from .jimeng import request_gateway
+
+    jobs = allrows("""SELECT id,provider_task_id,updated_at FROM jobs
+                      WHERE billing_status='pending' AND status IN ('completed','failed')
+                        AND provider_task_id!='' AND billing_check_at<=?
+                      ORDER BY billing_check_at,updated_at LIMIT 10""", (int(time.time()),))
+    for job in jobs:
+        now_epoch = int(time.time())
+        age = now_epoch - datetime.fromisoformat(job['updated_at']).timestamp()
+        delay = 60 if age < 3600 else 900 if age < 86400 else 86400
+        with db() as c:
+            c.execute("UPDATE jobs SET billing_check_at=? WHERE id=? AND billing_status='pending'",
+                      (now_epoch + delay, job['id']))
+        try:
+            result = await request_gateway('GET', f"/v1/tasks/{job['provider_task_id']}/charge")
+        except HTTPException as exc:
+            logger.debug('Jimeng charge lookup for job %s returned %s', job['id'], exc.status_code)
+            continue
+        amount = result.get('amount') if isinstance(result, dict) else None
+        if type(amount) is int and 0 <= amount <= 2**63 - 1:
+            settle_jimeng_charge(job['id'], amount)
+
+
+async def run_jimeng_billing_worker():
+    while True:
+        try:
+            await reconcile_jimeng_charges()
+        except Exception:
+            logger.exception('Could not reconcile Jimeng charges')
+        await asyncio.sleep(15)
 
 
 @asynccontextmanager
@@ -257,14 +332,13 @@ async def lifespan(_app):
         for _ in range(MAX_JOB_CONCURRENCY)
     ]
     resource_monitor = asyncio.create_task(adjust_job_concurrency(state))
+    billing_worker = asyncio.create_task(run_jimeng_billing_worker())
     try:
         yield
     finally:
-        # Unfinished jobs stay in SQLite so the next startup can resume them.
-        resource_monitor.cancel()
-        for worker in workers:
+        for worker in (*workers, resource_monitor, billing_worker):
             worker.cancel()
-        await asyncio.gather(resource_monitor, *workers, return_exceptions=True)
+        await asyncio.gather(resource_monitor, billing_worker, *workers, return_exceptions=True)
 
 
 app = FastAPI(title='雪宝 Studio API', version='0.1.0', lifespan=lifespan)
@@ -417,8 +491,10 @@ def models(kind: Literal['image', 'video'] | None = None, user=Depends(whoami)):
     for m in rows:
         item = {'id': m['id'], 'name': m['name'], 'kind': m['kind'], 'cost': m['cost'],
                 'model_code': m['model_code'], 'is_demo': m['protocol'] == 'demo'}
+        if is_jimeng(m):
+            item['billing_mode'] = 'jimeng_actual'
         if m['kind'] == 'video':
-            capability = jimeng_capabilities(m) if is_jimeng(m) else None
+            capability = jimeng_capabilities(m) if 'billing_mode' in item else None
             item.update(capability or {'duration_min': 1, 'duration_max': 30,
                                        'duration_options': [5, 10, 15, 30]})
         result.append(item)
@@ -706,21 +782,25 @@ async def create_job(data: CreateJob, user=Depends(whoami)):
         if 'ratio' not in data.model_fields_set or data.ratio == 'auto':
             opts['ratio'] = image_size_ratio(width, height)
     cost = model['cost']
+    charged_points = 0 if jimeng_model else cost
+    billing_status = 'pending' if jimeng_model else ''
+    reserved_points = cost if jimeng_model else 0
     with db() as c:
         c.execute('BEGIN IMMEDIATE')
-        changed = c.execute('UPDATE users SET points=points-? WHERE id=? AND points>=?',
-                            (cost, user['id'], cost)).rowcount
-        if changed == 0:
+        if not can_spend_points(c, user['id'], cost):
             c.execute('ROLLBACK')
-            raise HTTPException(402, '积分不足，请联系管理员充值')
+            raise HTTPException(402, '可用积分不足，请等待正在生成的任务完成或联系管理员充值')
+        if charged_points:
+            adjust_points(c, user['id'], -charged_points)
         c.execute('''INSERT INTO jobs
-          (id,user_id,project_id,model_id,kind,prompt,options_json,charged_points,created_at,updated_at)
-          VALUES(?,?,?,?,?,?,?,?,?,?)''',
+          (id,user_id,project_id,model_id,kind,prompt,options_json,charged_points,
+           billing_status,reserved_points,created_at,updated_at)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',
           (job_id, user['id'], data.project_id, model['id'], model['kind'],
-           data.prompt, json.dumps(opts), cost, now(), now()))
+           data.prompt, json.dumps(opts), charged_points, billing_status, reserved_points, now(), now()))
         c.execute('COMMIT')
     launch_job(job_id)
-    return {'id': job_id, 'status': 'queued', 'cost': cost}
+    return {'id': job_id, 'status': 'queued', 'cost': charged_points, 'billing_status': billing_status}
 
 
 @app.get('/api/jobs')
@@ -890,7 +970,7 @@ def delete_model(model_id: int, user=Depends(admin_only)):
 
 @app.get('/api/admin/users')
 def admin_users(user=Depends(admin_only)):
-    return allrows('SELECT id,username,role,points,created_at FROM users ORDER BY id DESC LIMIT 200')
+    return allrows('SELECT id,username,role,points-points_due AS points,created_at FROM users ORDER BY id DESC LIMIT 200')
 
 
 class AdminUserCreate(BaseModel):
@@ -952,17 +1032,17 @@ class CreditChange(BaseModel):
 @app.post('/api/admin/users/{user_id}/credits')
 def change_credit(user_id: int, data: CreditChange, user=Depends(admin_only)):
     with db() as c:
-        updated = c.execute('UPDATE users SET points=points+? WHERE id=? AND points+?>=0',
-                            (data.amount, user_id, data.amount)).rowcount
-    if not updated:
-        raise HTTPException(400, '用户不存在或扣减后积分不足')
+        c.execute('BEGIN IMMEDIATE')
+        if (data.amount < 0 and not can_spend_points(c, user_id, -data.amount)) or not adjust_points(c, user_id, data.amount):
+            raise HTTPException(400, '用户不存在或扣减后可用积分不足')
+        c.execute('COMMIT')
     return {'ok': True}
 
 
 @app.get('/api/admin/jobs')
 def admin_jobs(user=Depends(admin_only)):
     return allrows('''SELECT j.id,u.username,m.name AS model_name,j.kind,j.status,j.charged_points,
-                             j.error,j.created_at
+                             j.billing_status,j.error,j.created_at
                        FROM jobs j JOIN users u ON u.id=j.user_id JOIN models m ON m.id=j.model_id
                        ORDER BY j.created_at DESC LIMIT 100''')
 

@@ -91,6 +91,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     error_kind    TEXT NOT NULL DEFAULT '',
     forecast_credits INTEGER,
     charged_credits  INTEGER,
+    key_debit_credits INTEGER,
+    credit_history_cursor TEXT NOT NULL DEFAULT '',
     attempts      INTEGER NOT NULL DEFAULT 0,
     submit_draft  TEXT NOT NULL DEFAULT '',
     created_at    INTEGER NOT NULL,
@@ -187,6 +189,8 @@ def init() -> None:
         _ensure_columns(c, "tasks", {
             "mask_uri": "TEXT NOT NULL DEFAULT ''",
             "extras": "TEXT NOT NULL DEFAULT '{}'",
+            "key_debit_credits": "INTEGER",
+            "credit_history_cursor": "TEXT NOT NULL DEFAULT ''",
             # 吸附过程（"请求了 A、实际做 B"）：客户端看不到，面板要能查
             "degradations": "TEXT NOT NULL DEFAULT '[]'",
         })

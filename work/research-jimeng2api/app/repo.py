@@ -340,12 +340,12 @@ def admin_key_exists() -> bool:
     return bool(db.scalar("SELECT COUNT(*) FROM api_keys WHERE is_admin = 1"))
 
 
-def charge_key(key_id: int | None, credits: int | None) -> None:
+def _charge_key(connection, key_id: int | None, credits: int) -> None:
     if not key_id or not credits:
         return
-    db.execute(
+    connection.execute(
         "UPDATE api_keys SET used_credits = used_credits + ? WHERE id = ?",
-        (int(credits), key_id))
+        (credits, key_id))
 
 
 # --------------------------------------------------------------------- 任务
@@ -371,7 +371,8 @@ def create_task(*, task_id: str, api_key_id: int | None, mode: str,
         "INSERT INTO tasks(id, api_key_id, mode, model, prompt, negative_prompt,"
         " size, width, height, resolution, count, seed, image_uris, mask_uri,"
         " extras, degradations, status, created_at, updated_at, next_poll_at) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'queued',?,?,0)",
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'queued',?,?,0) "
+        "ON CONFLICT(id) DO NOTHING",
         (task_id, api_key_id, mode, model, prompt, negative_prompt, size,
          width, height, resolution, count, seed, db.dumps(image_uris),
          mask_uri, db.dumps(extras or {}), db.dumps(degradations or []),
@@ -394,6 +395,22 @@ def get_task_status(task_id: str) -> dict | None:
         (task_id,),
     )
     return task_row(row) if row else None
+
+
+def get_task_charge(task_id: str) -> dict | None:
+    row = db.one(
+        "SELECT api_key_id, account_id, status, charged_credits, credit_history_cursor "
+        "FROM tasks WHERE id = ?", (task_id,))
+    return dict(row) if row else None
+
+
+def advance_credit_history_cursor(task_id: str, previous: str, cursor: str) -> None:
+    if previous == cursor:
+        return
+    db.execute(
+        "UPDATE tasks SET credit_history_cursor = ? WHERE id = ? "
+        "AND credit_history_cursor = ? AND charged_credits IS NULL",
+        (cursor, task_id, previous))
 
 
 def claim_queued(limit: int) -> list[dict]:
@@ -467,12 +484,14 @@ def mark_task_queued_retry(task_id: str, error: str) -> None:
         "account_id = NULL WHERE id = ?", (error[:300], db.now(), task_id))
 
 
-def mark_task_failed(task_id: str, error: str, kind: str = "") -> None:
+def mark_task_failed(task_id: str, error: str, kind: str = "", *,
+                     no_charge: bool = False) -> None:
     now = db.now()
     db.execute(
         "UPDATE tasks SET status = 'failed', error = ?, error_kind = ?, "
-        "finished_at = ?, updated_at = ? WHERE id = ?",
-        (error[:600], kind, now, now, task_id))
+        "finished_at = ?, updated_at = ?, "
+        "charged_credits = COALESCE(charged_credits, ?) WHERE id = ?",
+        (error[:600], kind, now, now, 0 if no_charge else None, task_id))
 
 
 def update_task_poll(task_id: str, *, upstream_status: int | None,
@@ -487,18 +506,48 @@ def finish_task(task_id: str, *, images: list[dict], forecast: int | None,
                 status: str = "succeeded",
                 upstream_status: int | None = None) -> None:
     now = db.now()
-    db.execute(
-        "UPDATE tasks SET status = ?, images = ?, forecast_credits = "
-        "COALESCE(?, forecast_credits), progress = ?, upstream_status = "
-        "COALESCE(?, upstream_status), finished_at = ?, updated_at = ? "
-        "WHERE id = ?",
-        (status, db.dumps(images), forecast, f"{len(images)} 张",
-         upstream_status, now, now, task_id))
+    with db.tx() as connection:
+        task = connection.execute(
+            "SELECT status, api_key_id, forecast_credits FROM tasks WHERE id = ?",
+            (task_id,)).fetchone()
+        if not task or task["status"] in ("succeeded", "failed"):
+            return
+        debit = int(forecast or task["forecast_credits"] or 0) if status == "succeeded" else 0
+        updated = connection.execute(
+            "UPDATE tasks SET status = ?, images = ?, forecast_credits = "
+            "COALESCE(?, forecast_credits), progress = ?, upstream_status = "
+            "COALESCE(?, upstream_status), finished_at = ?, updated_at = ?, "
+            "key_debit_credits = ? WHERE id = ? AND status NOT IN ('succeeded', 'failed')",
+            (status, db.dumps(images), forecast, f"{len(images)} 张",
+             upstream_status, now, now, debit, task_id))
+        if updated.rowcount:
+            _charge_key(connection, task["api_key_id"], debit)
 
 
-def set_charged(task_id: str, credits: int | None) -> None:
-    db.execute("UPDATE tasks SET charged_credits = ? WHERE id = ?",
-               (credits, task_id))
+def set_charged(task_id: str, credits: int) -> int | None:
+    """Store the actual charge and adjust the key quota in the same transaction."""
+    with db.tx() as connection:
+        task = connection.execute(
+            "SELECT status, api_key_id, forecast_credits, charged_credits, key_debit_credits "
+            "FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if not task or task["status"] not in ("succeeded", "failed"):
+            return None
+        if task["charged_credits"] is not None:
+            return task["charged_credits"]
+        previous = task["key_debit_credits"]
+        if previous is None:
+            # Older gateway versions applied a forecast only to successful tasks.
+            previous = (task["forecast_credits"] or 0) if task["status"] == "succeeded" else 0
+        updated = connection.execute(
+            "UPDATE tasks SET charged_credits = ?, key_debit_credits = ? "
+            "WHERE id = ? AND charged_credits IS NULL",
+            (credits, credits, task_id))
+        if not updated.rowcount:
+            settled = connection.execute(
+                "SELECT charged_credits FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            return settled["charged_credits"] if settled else None
+        _charge_key(connection, task["api_key_id"], credits - int(previous))
+        return credits
 
 
 def due_tasks(now: int | None = None) -> list[dict]:

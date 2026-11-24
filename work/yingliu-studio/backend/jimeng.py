@@ -4,6 +4,7 @@ import json
 import re
 import secrets
 from datetime import datetime, timezone
+from uuid import UUID
 
 import httpx
 from fastapi import Depends, HTTPException, Request, Response
@@ -12,6 +13,7 @@ from .db import DATA, db, now, encrypt_secret, decrypt_secret
 
 BASE = 'http://127.0.0.1:8300'
 GENERATE_URL = BASE + '/async/v1/images/generations'
+GENERATION_PATH = '/async/v1/images/generations'
 JIMENG_VIDEO_RESOLUTIONS = ('480p', '720p', '1080p')
 VIDEO_RATIOS = ('16:9', '9:16', '1:1', '4:3', '3:4', '21:9')
 JIMENG_VIDEO_MODELS = (
@@ -71,20 +73,23 @@ def validate_jimeng_resolution(model, resolution):
         raise ValueError('当前即梦模型支持的分辨率：' + '、'.join(capability['resolutions']))
 
 
-async def request_gateway(method, path, payload=None):
+async def request_gateway(method, path, payload=None, *, idempotency_key=None):
+    headers = {'Authorization': 'Bearer ' + gateway_key()}
+    if idempotency_key:
+        headers['Idempotency-Key'] = idempotency_key
     try:
         async with httpx.AsyncClient(timeout=60, trust_env=False) as client:
-            response = await client.request(method, BASE + path, json=payload,
-                headers={'Authorization': 'Bearer ' + gateway_key()})
+            response = await client.request(method, BASE + path, json=payload, headers=headers)
     except httpx.RequestError as exc:
         raise HTTPException(503, '即梦号池服务未连接，请检查本地服务是否启动') from exc
     if response.is_error:
         try:
-            error = response.json().get('error', {})
-            message = error.get('message', '即梦服务请求失败') if isinstance(error, dict) else str(error)
+            data = response.json()
+            error = data.get('error') or data.get('detail')
+            message = error.get('message') if isinstance(error, dict) else error
         except ValueError:
-            message = '即梦服务请求失败'
-        raise HTTPException(response.status_code, message)
+            message = None
+        raise HTTPException(response.status_code, message or '即梦服务请求失败')
     return response.json()
 
 
@@ -157,6 +162,45 @@ def _sync_admin_messages(accounts):
                      event_at, now()))
 
 
+async def resume_submission(job):
+    task_id = job['provider_task_id']
+    if not task_id:
+        return
+    try:
+        await request_gateway('GET', f'{GENERATION_PATH}/{task_id}')
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            # ID was persisted before dispatch. Retry the same ID if dispatch was interrupted.
+            job['provider_task_id'] = ''
+            job['retrying_submission'] = True
+        elif exc.status_code != 429 and exc.status_code < 500:
+            raise
+
+
+async def submit_generation(job, payload, set_provider_id):
+    if job.get('billing_status') != 'pending':
+        return (await request_gateway('POST', GENERATION_PATH, payload))['task_id']
+
+    task_id = str(UUID(job['id']))
+    set_provider_id(task_id)
+    for attempt in range(3):
+        try:
+            result = await request_gateway('POST', GENERATION_PATH, payload, idempotency_key=task_id)
+            return result['task_id']
+        except HTTPException as exc:
+            if exc.status_code not in (408, 429) and exc.status_code < 500:
+                if attempt == 0 and not job.get('retrying_submission'):
+                    set_provider_id('')
+                raise
+            if attempt < 2:
+                await asyncio.sleep(4)
+    try:
+        await request_gateway('GET', f'{GENERATION_PATH}/{task_id}')
+    except HTTPException as exc:
+        raise ValueError('即梦提交结果暂无法确认，系统将继续核对积分，请避免重复提交') from exc
+    return task_id
+
+
 async def generate(model, job, context, set_provider_id):
     duration = context['duration']
     validate_jimeng_duration(model, duration)
@@ -181,15 +225,14 @@ async def generate(model, job, context, set_provider_id):
             payload['reference_mode'] = options.get('reference_mode') or (
                 'multi_image' if isinstance(payload['image'], list) else 'frames'
             )
-        result = await request_gateway('POST', '/async/v1/images/generations', payload)
-        task_id = result['task_id']
+        task_id = await submit_generation(job, payload, set_provider_id)
         set_provider_id(task_id)
         del payload, reference
     del context
     # Resume persisted tasks after a Studio restart; never resubmit a known task.
     for _ in range(21600):
         try:
-            result = await request_gateway('GET', '/async/v1/images/generations/' + str(task_id))
+            result = await request_gateway('GET', f'{GENERATION_PATH}/{task_id}')
         except HTTPException as exc:
             if exc.status_code == 429 or exc.status_code >= 500:
                 await asyncio.sleep(4)

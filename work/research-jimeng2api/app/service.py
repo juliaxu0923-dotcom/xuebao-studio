@@ -470,7 +470,8 @@ def cutout(*, api_key_id: int | None, image: str) -> dict:
 def _create_video_task(*, api_key_id: int | None, model: str, prompt: str,
                        resolution: str, duration: int | None,
                        ratio: str,
-                       images: Sequence[str] | None = None, reference_mode: str = 'frames') -> dict:
+                       images: Sequence[str] | None = None, reference_mode: str = 'frames',
+                       task_id: str) -> dict:
     """建视频任务。参数边界来自 `/mweb/v1/video_generate/get_common_config`。"""
     vm = video.get(model)
     if vm is None:
@@ -522,7 +523,7 @@ def _create_video_task(*, api_key_id: int | None, model: str, prompt: str,
             kind="param")
 
     return repo.create_task(
-        task_id=str(uuid.uuid4()), api_key_id=api_key_id, mode="video",
+        task_id=task_id, api_key_id=api_key_id, mode="video",
         model=vm.key, prompt=text, negative_prompt="", size="",
         width=0, height=0, resolution=res, count=1, seed=None,
         image_uris=frames, mask_uri="",
@@ -537,7 +538,7 @@ def _create_postedit_task(*, api_key_id: int | None, model: str, prompt: str,
                           images: list[str], mask: str | None,
                           ratio: str = "", scale: float | None = None,
                           markers: list[dict] | None = None,
-                          extras: dict | None = None) -> dict:
+                          extras: dict | None = None, task_id: str) -> dict:
     """后编辑建任务：**没有 prompt 也能跑**，但必须恰好一张输入图。
 
     这里只做形态校验与落库，真正的上传/提交在协调器里 —— 与 t2i/i2i 同一条
@@ -644,7 +645,6 @@ def _create_postedit_task(*, api_key_id: int | None, model: str, prompt: str,
     else:
         res = ""
 
-    task_id = str(uuid.uuid4())
     task = repo.create_task(
         task_id=task_id, api_key_id=api_key_id, mode="postedit",
         model=ability.key, prompt=str(prompt or ""), negative_prompt="",
@@ -668,7 +668,8 @@ def create_task(*, api_key_id: int | None, model: str, prompt: str,
                 ratio: str = "", scale: float | None = None,
                 markers: list[dict] | None = None,
                 duration: int | None = None,
-                extras: dict | None = None) -> dict:
+                extras: dict | None = None, task_id: str | None = None) -> dict:
+    task_id = task_id or str(uuid.uuid4())
     refs = [x for x in (images or []) if x]
     # 别名先归一：否则直接调本函数（脚本/测试）时，别名指向后编辑能力会被
     # 当成生成模型送进 resolve_request，报一个误导性的"未知模型"。
@@ -677,13 +678,13 @@ def create_task(*, api_key_id: int | None, model: str, prompt: str,
     # 所以最先分流 —— 不能落到 resolve_request 里（那会报"未知模型"）。
     if video.is_video(model):
         return _create_video_task(
-            api_key_id=api_key_id, model=model, prompt=prompt,
+            task_id=task_id, api_key_id=api_key_id, model=model, prompt=prompt,
             resolution=resolution, duration=duration, ratio=ratio,
             images=refs, reference_mode=(extras or {}).get('reference_mode', 'frames'))
     # 后编辑与 t2i/i2i 的草稿结构不同（无 core_param），先分流再解析模型
     if postedit.is_postedit(model):
         return _create_postedit_task(
-            api_key_id=api_key_id, model=model, prompt=prompt, size=size,
+            task_id=task_id, api_key_id=api_key_id, model=model, prompt=prompt, size=size,
             count=count, resolution=resolution, images=refs, mask=mask,
             ratio=ratio, scale=scale, markers=markers, extras=extras)
     reason = postedit.unsupported_reason(model)
@@ -697,7 +698,6 @@ def create_task(*, api_key_id: int | None, model: str, prompt: str,
         raise JimengParamError("图生图必须给 prompt（描述要怎么改）", kind="param")
     if not str(prompt or "").strip():
         raise JimengParamError("prompt 不能为空", kind="param")
-    task_id = str(uuid.uuid4())
     task = repo.create_task(
         task_id=task_id, api_key_id=api_key_id, mode=mode,
         model=resolved["model"], prompt=prompt,
@@ -757,7 +757,7 @@ def submit_task(task: dict) -> None:
     last_err: JimengError | None = None
 
     if not any(a["enabled"] for a in repo.list_accounts()):
-        repo.mark_task_failed(task_id, "账号池为空或全部被禁用", "pool")
+        repo.mark_task_failed(task_id, "账号池为空或全部被禁用", "pool", no_charge=True)
         return
 
     # `item:` 引用绑账号：作品属于哪个号，就只能用那个号提交。
@@ -782,7 +782,7 @@ def submit_task(task: dict) -> None:
                 repo.mark_task_failed(
                     task_id,
                     f"该作品属于账号 #{pinned}，它当前不可用（禁用/冷却/在途已满）；"
-                    "item 引用不能换号重试", "pool")
+                    "item 引用不能换号重试", "pool", no_charge=True)
                 return
         if not cands:
             break
@@ -790,6 +790,7 @@ def submit_task(task: dict) -> None:
         tried.add(account["id"])
         db.execute("UPDATE tasks SET attempts = attempts + 1 WHERE id = ?",
                    (task_id,))
+        dispatch_started = False
         try:
             uris = task["image_uris"]
             if task["mode"] == "i2i" and uris:
@@ -802,6 +803,10 @@ def submit_task(task: dict) -> None:
                     # 尺寸，只能靠这里存下来的值，否则 width/height 退化成 0
                     db.execute("UPDATE tasks SET extras = ? WHERE id = ?",
                                (db.dumps(task["extras"]), task_id))
+            # A process interruption after submit must leave the account available for billing lookup.
+            db.execute("UPDATE tasks SET account_id = ? WHERE id = ?",
+                       (account["id"], task_id))
+            dispatch_started = True
             _submit(account["id"], task, uris)
             repo.mark_task_running(
                 task_id, account["id"],
@@ -816,16 +821,16 @@ def submit_task(task: dict) -> None:
             return
         except JimengError as e:
             last_err = e
-            db.execute('UPDATE tasks SET account_id = ? WHERE id = ?', (account['id'], task_id))
             _mark_account_fault(account["id"], e)
             if e.kind in ("auth", "quota", "rate", "risk"):
                 continue  # 上游明确拒绝：任务未创建，换号安全
-            repo.mark_task_failed(task_id, str(e), e.kind)
+            repo.mark_task_failed(task_id, str(e), e.kind, no_charge=not dispatch_started)
             return
 
     # 走到这里说明本轮没有提交成功：要么没号可用，要么全被明确拒绝
     if last_err is None and any(a['state'] == 'confirmation' for a in repo.list_accounts()):
-        repo.mark_task_failed(task_id, '需要生成内容使用确认，请管理员查看号池生成诊断', 'confirmation')
+        repo.mark_task_failed(task_id, '需要生成内容使用确认，请管理员查看号池生成诊断',
+                              'confirmation', no_charge=True)
         return
     msg = str(last_err) if last_err else "没有可用账号（全部冷却 / 禁用 / 失效）"
     attempts = int(db.scalar("SELECT attempts FROM tasks WHERE id = ?",
@@ -834,12 +839,12 @@ def submit_task(task: dict) -> None:
         # 没有可用账号（冷却/在途满）：等，但只等到 10 分钟，避免任务永远排队
         age = db.now() - int(task["created_at"])
         if age > 600:
-            repo.mark_task_failed(task_id, f"等待可用账号超时（{msg}）", "pool")
+            repo.mark_task_failed(task_id, f"等待可用账号超时（{msg}）", "pool", no_charge=True)
             return
         delay = 15
     else:
         if attempts >= 4 + int(cfg["max_retry"]):
-            repo.mark_task_failed(task_id, msg, last_err.kind)
+            repo.mark_task_failed(task_id, msg, last_err.kind, no_charge=True)
             return
         delay = min(60, 10 * max(1, attempts))
     repo.mark_task_queued_retry(task_id, f"{msg}；稍后重试")
@@ -1012,8 +1017,6 @@ def poll_once() -> None:
     cfg = repo.runtime_config()
     interval = float(cfg["poll_interval"])
     tasks = repo.due_tasks()
-    if not tasks:
-        return
     # 兜底：卡在 submitting 超过 2 分钟的任务（进程重启/提交线程崩溃）
     for row in repo.recent_submissions():
         if db.now() - (row["updated_at"] or 0) > 120:
@@ -1021,6 +1024,8 @@ def poll_once() -> None:
                 row["id"],
                 "提交状态未知（进程中断）。上游**可能已创建并计费**，"
                 "请先到即梦作品页确认，再决定是否重提", "unknown")
+    if not tasks:
+        return
 
     by_account: dict[int, list[dict]] = {}
     for t in tasks:
@@ -1069,11 +1074,6 @@ def poll_once() -> None:
                 except Exception:  # noqa: BLE001 —— 记账失败不该影响交付
                     log.warning("记录产物归属失败 task=%s", t["id"], exc_info=True)
                 repo.record_account_result(account_id, ok=True)
-                est = st.get("cost") or t.get("forecast_credits")
-                if est:
-                    repo.charge_key(t.get("api_key_id"), int(est))
-                db.execute("UPDATE tasks SET charged_credits = COALESCE(charged_credits, ?) "
-                           "WHERE id = ?", (None, t["id"]))
             elif st.get("failed"):
                 msg = st.get("fail_message") or "上游生成失败"
                 repo.mark_task_failed(t["id"], msg, st.get('fail_kind') or 'upstream')
@@ -1087,50 +1087,64 @@ def poll_once() -> None:
 
 
 # ---------------------------------------------------------------- 对账/刷新
-def reconcile(task_id: str) -> dict:
+def reconcile(task_id: str, task: dict | None = None) -> dict:
     """按 submit_id 在消耗记录里找真实扣费。
 
     上游消耗记录**延迟结算**：跑完立刻查可能还没有那条记录 ⇒
     `found=false` 不等于免费，面板必须这样写。
     """
-    task = repo.get_task(task_id)
-    if not task or not task.get("account_id"):
+    task = task if task is not None else repo.get_task_charge(task_id)
+    if not task or task["status"] not in ("succeeded", "failed"):
+        return {"found": False, "reason": "任务尚未结束或不存在"}
+    if task["charged_credits"] is not None:
+        return {"found": True, "amount": task["charged_credits"]}
+    if not task["account_id"]:
         return {"found": False, "reason": "任务没有绑定账号"}
+    previous_cursor = task["credit_history_cursor"]
+    cursor = "0"
     try:
         rt = pool_mod.pool.runtime(task["account_id"])
-        # 每页最多 20 条（再大就 1000），最多翻 3 页 = 60 条
-        hit = None
-        cursor = "0"
-        for _ in range(3):
+        # Always check the newest page for late charges, then resume the older pages.
+        seen_cursors = {cursor}
+        for page in range(3):
             data = rt.client.credit_history(count=20, history_type=2,
                                             cursor=cursor)
             records = data.get("records") or []
-            hit = next((r for r in records
-                        if str(r.get("submit_id")) == task_id), None)
-            if hit or not data.get("has_more"):
+            if not isinstance(records, list):
+                return {"found": False, "reason": "上游消耗流水格式无效"}
+            hits = [r for r in records
+                    if isinstance(r, dict) and r.get("submit_id") == task_id]
+            if hits:
+                amount = _parse_charge(hits[0].get("amount"))
+                if amount is None or any(_parse_charge(r.get("amount")) != amount for r in hits[1:]):
+                    return {"found": False, "reason": "上游消耗记录金额无效或不一致"}
+                amount = repo.set_charged(task_id, amount)
+                if amount is not None:
+                    return {"found": True, "amount": amount, "record": hits[0]}
+                return {"found": False, "reason": "任务状态已变更"}
+            next_cursor = str(data.get("new_cursor") or "") if data.get("has_more") else ""
+            if page == 0 and next_cursor and previous_cursor:
+                next_cursor = previous_cursor
+            if not next_cursor or next_cursor in seen_cursors:
+                cursor = ""
                 break
-            cursor = str(data.get("new_cursor") or "")
-            if not cursor:
-                break
+            cursor = next_cursor
+            seen_cursors.add(cursor)
     except JimengError as e:
+        if e.kind == "param" and cursor != "0":
+            repo.advance_credit_history_cursor(task_id, previous_cursor, "")
         return {"found": False, "reason": str(e)}
-    if not hit:
-        # 免费档（会员 Lite 实测 0 积分）本来就不会产生消耗记录 —— 别把
-        # "没有记录"说成"没结算"，两者要分开讲。
-        return {"found": False,
-                "reason": "最近 60 条消耗记录里没有这个 submit_id：可能尚未结算，"
-                          "也可能本次为 0 积分（免费档）"}
-    amount = hit.get("amount")
-    try:
-        amount_i = int(amount)
-    except (TypeError, ValueError):
-        amount_i = None
-    old = task.get("charged_credits")
-    repo.set_charged(task_id, amount_i)
-    if amount_i is not None:
-        base = old if old is not None else (task.get("forecast_credits") or 0)
-        repo.charge_key(task.get("api_key_id"), amount_i - int(base))
-    return {"found": True, "amount": amount, "record": hit}
+    repo.advance_credit_history_cursor(task_id, previous_cursor, cursor)
+    # 即梦有延迟记账，会员免费档也可能没有流水。两种情况都先保留待对账。
+    return {"found": False, "reason": "已查的消耗记录里还没有这个 submit_id 的可用金额"}
+
+
+def _parse_charge(value: object) -> int | None:
+    if isinstance(value, str) and re.fullmatch(r"[0-9]{1,19}", value):
+        value = int(value)
+    if type(value) is int and 0 <= value <= 2**63 - 1:
+        return value
+    return None
 
 
 def refresh_task_images(task_id: str) -> dict:
